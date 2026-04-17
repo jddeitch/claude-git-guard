@@ -1,0 +1,35 @@
+{
+  "name": "claude-git-guard",
+  "version": "0.1.0",
+  "description": "Claude Code PreToolUse hook that blocks multi-agent branch accidents — edits on protected branches, cross-session drift, cross-repo cd, pull pointer moves.",
+  "main": "git-guard.mjs",
+  "type": "module",
+  "bin": {
+    "claude-git-guard": "./git-guard.mjs"
+  },
+  "scripts": {
+    "test": "node tests/run.mjs"
+  },
+  "keywords": [
+    "claude-code",
+    "pretooluse",
+    "hook",
+    "git",
+    "worktree",
+    "multi-agent",
+    "safety"
+  ],
+  "author": "JD Deitch <jd@jddeitch.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jddeitch/claude-git-guard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jddeitch/claude-git-guard/issues"
+  },
+  "homepage": "https://github.com/jddeitch/claude-git-guard#readme",
+  "engines": {
+    "node": ">=20"
+  }
+}
