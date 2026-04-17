@@ -92,9 +92,11 @@ npm test
 
 The harness spawns the hook as a subprocess with controlled stdin, asserts exit codes and stdout/stderr contents. Add a case for any new rule or edge case.
 
-## Contributing
+## Maintenance
 
-Issues and PRs welcome. Any change that touches the rules themselves should come with at least one test.
+This is a personal project released as-is. I built it for my own multi-agent Claude Code workflow. Issues and PRs are welcome, but I'll only act on them when something affects me. Fork freely — you're probably faster fixing a problem in your own fork than waiting on me.
+
+Any change to the rules themselves should come with at least one test.
 
 ## Credits
 
