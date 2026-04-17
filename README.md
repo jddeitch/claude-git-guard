@@ -4,7 +4,7 @@ A [Claude Code](https://claude.com/claude-code) PreToolUse hook that blocks mult
 
 One Node file, no dependencies. Catches the specific failure modes that surface when you run several Claude Code agents on the same git repo — edits on protected branches, cross-session branch drift, cross-repo `cd`, `git pull` pointer moves, and more.
 
-Derived from a hook that's been in production for three months inside a personal AI system. See [the accompanying essay](https://jddeitch.substack.com/) for the backstory (link goes live with the repo).
+Derived from a hook that's been in production for three months inside a personal AI system. 
 
 ## What it blocks
 
