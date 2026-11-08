@@ -12,13 +12,15 @@
 //   R2   Block if branch drifted since session start
 //
 // Bash path — mixed:
-//   R0   BLOCK cd to a different git repo (by common git dir, so cd into
+//   R0   BLOCK cd/pushd to a different git repo — every cd in the command,
+//        ~ included (by common git dir, so cd into
 //        the repo's own worktrees is allowed)
 //   R3   WARN before `git push` targeting a protected branch
 //   R5   BLOCK `git pull <remote> <ref>` on ANY branch when ref differs
 //        from the current branch name. Override via
 //        GIT_GUARD_ALLOW_POINTER_MOVE=1 prefix.
-//   R4   WARN when other sessions are active on destructive verbs
+//   R4   WARN when other sessions work where the command reaches (same
+//        checkout; same repo for the shared stash list) on destructive verbs
 //        (stash, checkout, switch, reset --hard) and on commands that
 //        sweep up other sessions' files (add -A/-u/., commit -a/., clean,
 //        stash -u)
@@ -90,7 +92,10 @@ const POINTER_GUARD_OVERRIDE_ENV = 'GIT_GUARD_ALLOW_POINTER_MOVE';
  * otherwise break out of the quoted argument in a shell command string.
  */
 function resolveGitContext(filePath) {
-  const dir = filePath ? path.dirname(filePath) : process.cwd();
+  // Nearest EXISTING ancestor: a Write may create new directories, and
+  // `git -C <missing dir>` fails — which used to fail the whole hook open,
+  // so a Write to main/newdir/x.md slipped past R1 entirely.
+  const dir = filePath ? nearestExistingDir(path.dirname(path.resolve(filePath))) : process.cwd();
   const toplevel = execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], {
     encoding: 'utf-8', timeout: 5000,
   }).trim();
@@ -98,6 +103,32 @@ function resolveGitContext(filePath) {
     encoding: 'utf-8', timeout: 5000,
   }).trim();
   return { toplevel, branch };
+}
+
+/** Walk up from `dir` to the first path that exists as a directory. */
+function nearestExistingDir(dir) {
+  let cur = dir;
+  for (;;) {
+    try {
+      if (fs.statSync(cur).isDirectory()) return cur;
+    } catch {
+      // missing — keep walking up
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) return cur;
+    cur = parent;
+  }
+}
+
+/**
+ * Canonicalize a path that may not exist yet: canonicalize its nearest
+ * existing ancestor (symlinks, on-disk case) and re-append the missing tail.
+ * `/var/…/repo/new/x.md` → `/private/var/…/repo/new/x.md` on macOS.
+ */
+function canonicalizeMaybeMissing(p) {
+  const abs = path.resolve(p);
+  const base = nearestExistingDir(abs);
+  return path.join(canonicalPath(base), path.relative(base, abs));
 }
 
 // Within-invocation memo for the hook CWD's branch. R3's bare-push check and
@@ -227,7 +258,8 @@ function firstLine(err) {
  * The path is canonicalized first (symlinks and on-disk case). Without
  * that, on macOS an Edit of `readme.md` would modify the tracked
  * `README.md` while `ls-files readme.md` reports it untracked. A path that
- * doesn't exist yet keeps its basename and canonicalizes its directory.
+ * doesn't exist yet (possibly in directories that don't exist yet) keeps
+ * its name and canonicalizes its nearest existing ancestor.
  *
  * `--literal-pathspecs` stops `*`, `?`, `[` in a file name being read as a
  * glob that matches other, tracked files. The pathspec is absolute, so git
@@ -239,7 +271,7 @@ function isTrackedPath(toplevel, filePath) {
   const top = canonicalPath(toplevel);
   // The path itself, with only its directory canonicalized (keeps a
   // symlink's own name; used when the file doesn't exist yet).
-  const lexical = path.join(canonicalPath(path.dirname(abs)), path.basename(abs));
+  const lexical = path.join(canonicalizeMaybeMissing(path.dirname(abs)), path.basename(abs));
   let canonical;
   try {
     canonical = fs.realpathSync.native(abs);
@@ -355,9 +387,11 @@ function handleEditWrite(sessionId, filePath) {
   }
 
   if (state.branch === branch) {
-    if (state.untracked_only === true && !untrackedOnly) {
-      writeSessionState(key, branch, sessionId, toplevel, false);
-    }
+    // Rewrite on every allowed edit: refreshes recorded_at (sessions expire
+    // STALE_MS after their LAST edit, not their first — a session running
+    // longer than a day used to drop out of R1b/R4 while still editing) and
+    // clears the untracked-only mark once a tracked file is touched.
+    writeSessionState(key, branch, sessionId, toplevel, untrackedOnly);
     process.exit(0);
   }
 
@@ -385,18 +419,32 @@ function handleEditWrite(sessionId, filePath) {
 }
 
 /**
- * Extract the cd target from a command string.
- * Handles: cd /path, cd /path && ..., cd /path ; ..., cd "/path with spaces"
- * Returns null if no cd found or target can't be statically resolved.
+ * Extract EVERY `cd`/`pushd` at a command boundary (start, `&&`, `||`, `;`,
+ * newline), in order. Each entry is { raw, target } where target is the
+ * statically-resolvable path (`~` and `~/…` expanded; bare `cd` = home) or
+ * null when it can't be known (`$VAR`, backticks, `cd -`, `~user`).
+ * `(cd x && …)` subshells are deliberately not matched: they don't move the
+ * session's working directory.
  */
-function extractCdTarget(command) {
-  const cdMatch = command.match(/(?:^|&&|;|\|\|)\s*cd\s+(?:"([^"]+)"|'([^']+)'|(\S+))/);
-  if (!cdMatch) return null;
-  const target = cdMatch[1] || cdMatch[2] || cdMatch[3];
-  if (!target) return null;
-  if (target.includes('$') || target.includes('`')) return null;
-  if (target.startsWith('~')) return null;
-  return target;
+function extractCdTargets(command) {
+  const re = /(?:^|&&|;|\|\||\n)[ \t]*(?:cd|pushd)(?:[ \t]+(?:"([^"]*)"|'([^']*)'|([^\s;&|()]+))|(?=[ \t]*(?:$|&&|;|\|\||\n)))/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(command)) !== null) {
+    if (m[0].length === 0) { re.lastIndex++; continue; }
+    const raw = m[1] ?? m[2] ?? m[3];
+    const quoted = m[3] === undefined && raw !== undefined; // shell doesn't expand ~ in quotes
+    let target;
+    if (raw === undefined) target = os.homedir();
+    else if (raw.includes('`') || (raw.includes('$') && m[2] === undefined) || raw === '-') target = null;
+    else if (quoted) target = raw;
+    else if (raw === '~') target = os.homedir();
+    else if (raw.startsWith('~/')) target = path.join(os.homedir(), raw.slice(2));
+    else if (raw.startsWith('~')) target = null;
+    else target = raw;
+    out.push({ raw: raw ?? '', target });
+  }
+  return out;
 }
 
 /**
@@ -449,19 +497,8 @@ function safeToplevel(cwd) {
  * Only a move into a genuinely separate repo is the escape R0 exists to catch
  * — there, later git commands would silently operate on the wrong project.
  */
-function checkCdEscape(cdTarget) {
-  let absTarget;
-  if (path.isAbsolute(cdTarget)) {
-    absTarget = cdTarget;
-  } else {
-    absTarget = path.resolve(process.cwd(), cdTarget);
-  }
-
-  try {
-    if (!fs.statSync(absTarget).isDirectory()) return { blocked: false };
-  } catch {
-    return { blocked: false };
-  }
+function checkCdEscape(cds) {
+  if (cds.length === 0) return { blocked: false };
 
   let currentCommon;
   try {
@@ -470,27 +507,51 @@ function checkCdEscape(cdTarget) {
     return { blocked: false }; // hook CWD not in a git repo — nothing to escape from
   }
 
-  // execFileSync (argv, no shell) so a cd target containing shell
-  // metacharacters can't break out.
-  let targetCommon;
-  try {
-    targetCommon = resolveCommonGitDir(absTarget);
-  } catch {
-    return { blocked: false }; // target not in a git repo — cd there can't retarget git
+  // Walk the cds in order: a relative target resolves against the previous
+  // one (`cd a && cd ../other`). After an unresolvable cd, relative targets
+  // can't be placed, but absolute ones still can.
+  let running = process.cwd();
+  for (const { raw, target } of cds) {
+    if (target === null) { running = null; continue; }
+    let absTarget;
+    if (path.isAbsolute(target)) absTarget = target;
+    else if (running !== null) absTarget = path.resolve(running, target);
+    else continue;
+    running = absTarget;
+
+    try {
+      if (!fs.statSync(absTarget).isDirectory()) continue;
+    } catch {
+      continue; // doesn't exist (yet) — let Bash report it
+    }
+
+    // execFileSync (argv, no shell) so a cd target containing shell
+    // metacharacters can't break out.
+    let targetCommon;
+    try {
+      targetCommon = resolveCommonGitDir(absTarget);
+    } catch {
+      continue; // target not in a git repo — cd there can't retarget git
+    }
+    if (currentCommon === targetCommon) continue;
+
+    return {
+      blocked: true,
+      message: escapeMessage(raw || '~', absTarget),
+    };
   }
+  return { blocked: false };
+}
 
-  if (currentCommon === targetCommon) return { blocked: false };
-
-  return {
-    blocked: true,
-    message:
-      `[git-guard R0 BLOCKED] "cd ${cdTarget}" would move to a different git repo.\n` +
-      `  Current repo: ${safeToplevel(process.cwd())}\n` +
-      `  Target repo:  ${safeToplevel(absTarget)}\n\n` +
-      'DO NOT STEAMROLL GIT-GUARD!\n' +
-      'This will cause all subsequent git commands to operate on the wrong repo.\n' +
-      'Use absolute paths instead of cd, or run commands in a separate worktree.\n',
-  };
+function escapeMessage(cdTarget, absTarget) {
+  return (
+    `[git-guard R0 BLOCKED] "cd ${cdTarget}" would move to a different git repo.\n` +
+    `  Current repo: ${safeToplevel(process.cwd())}\n` +
+    `  Target repo:  ${safeToplevel(absTarget)}\n\n` +
+    'DO NOT STEAMROLL GIT-GUARD!\n' +
+    'This will cause all subsequent git commands to operate on the wrong repo.\n' +
+    'Use absolute paths instead of cd, or run commands in a separate worktree.\n'
+  );
 }
 
 /**
@@ -768,7 +829,8 @@ const COMMIT_ARG_OPTS = [
   '--fixup', '--squash', '--template', '--cleanup', '--trailer', '--pathspec-from-file',
 ];
 const STASH_ARG_OPTS = ['-m', '--message', '--pathspec-from-file'];
-const STASH_NON_PUSH = new Set(['list', 'show', 'drop', 'pop', 'apply', 'branch', 'clear', 'create', 'store']);
+const STASH_READ_ONLY = new Set(['list', 'show', 'create']);
+const STASH_NON_PUSH = new Set(['drop', 'pop', 'apply', 'branch', 'clear', 'store']);
 
 const SWEEPS_UNTRACKED = 'sweeps up every file on this checkout, including other sessions\' new untracked files.';
 const SWEEPS_TRACKED = 'sweeps other sessions\' uncommitted changes to tracked files into your commit.';
@@ -786,6 +848,34 @@ const SWEEPS_TRACKED = 'sweeps other sessions\' uncommitted changes to tracked f
  *   stash push/save -u/--include-untracked/-a/--all (labelled specially;
  *   plain stash already warns)
  */
+/**
+ * The checkouts a git invocation can reach, as a Set of canonical
+ * toplevels, or null if that can't be determined.
+ *   'checkout': the one working tree the command runs in (-C path or CWD).
+ *   'repo':     every worktree of that repo (`git worktree list`).
+ */
+function affectedToplevels(cPath, scope) {
+  try {
+    const dir = cPath ? path.resolve(process.cwd(), cPath) : process.cwd();
+    if (dir.startsWith('-')) return null;
+    if (scope === 'repo') {
+      const out = execFileSync('git', ['-C', dir, 'worktree', 'list', '--porcelain'], {
+        encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const tops = out.split('\n')
+        .filter(l => l.startsWith('worktree '))
+        .map(l => canonicalPath(l.slice('worktree '.length)));
+      return tops.length > 0 ? new Set(tops) : null;
+    }
+    const top = execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    return new Set([canonicalPath(top)]);
+  } catch {
+    return null;
+  }
+}
+
 const R4_SUBCOMMANDS = new Set(['reset', 'checkout', 'switch', 'add', 'commit', 'clean', 'stash']);
 
 function classifyR4(inv) {
@@ -833,7 +923,12 @@ function classifyR4(inv) {
   }
 
   if (subcommand === 'stash') {
-    if (tokens.length > 0 && STASH_NON_PUSH.has(tokens[0])) return { label: 'git stash' };
+    if (tokens.length > 0 && STASH_READ_ONLY.has(tokens[0])) return null;
+    // The stash list is shared by every worktree of the repo, so pop/drop/
+    // clear/store/branch can take or destroy another worktree's stash.
+    if (tokens.length > 0 && STASH_NON_PUSH.has(tokens[0])) {
+      return { label: `git stash ${tokens[0]}`, scope: 'repo' };
+    }
     const { options } = splitArgs(tokens, STASH_ARG_OPTS);
     const untracked = options.some(o =>
       o === '-u' || o === '--include-untracked' || o === '-a' || o === '--all' ||
@@ -853,13 +948,10 @@ function handleBash(command, sessionId) {
   }
 
   // R0: Block cd to a different git repo
-  const cdTarget = extractCdTarget(command);
-  if (cdTarget) {
-    const check = checkCdEscape(cdTarget);
-    if (check.blocked) {
-      process.stderr.write(check.message);
-      process.exit(2);
-    }
+  const check = checkCdEscape(extractCdTargets(command));
+  if (check.blocked) {
+    process.stderr.write(check.message);
+    process.exit(2);
   }
 
   // Parse every `git <globals?> <subcommand> <rest>` invocation. R3/R4/R5
@@ -964,17 +1056,33 @@ function handleBash(command, sessionId) {
   // active. Matches on subcommand + rest rather than a regex against the
   // raw command, so `git -C <path> stash` (etc.) doesn't bypass the check.
   // Collects every match so a chained `git add -A && git commit` names both.
+  //
+  // Only sessions the command can actually reach count: those on the same
+  // checkout (scope 'checkout' — add, commit, clean, stash push, checkout,
+  // switch, reset only touch the working tree they run in), or on any
+  // worktree of the same repo (scope 'repo' — the shared stash list).
+  // Sessions on other repos are not warned about.
   const matched = [];
   for (const inv of invocations) {
     const hit = classifyR4(inv);
-    if (hit && !matched.some(m => m.label === hit.label)) matched.push(hit);
+    if (!hit) continue;
+    const affected = affectedToplevels(inv.cPath, hit.scope || 'checkout');
+    const prev = matched.find(m => m.label === hit.label);
+    if (!prev) matched.push({ ...hit, affected });
+    else if (prev.affected && affected) affected.forEach(t => prev.affected.add(t));
+    else prev.affected = null;
   }
   if (matched.length > 0) {
     ensureStateDir();
-    const others = getOtherSessions(sessionId);
+    // affected === null means the target couldn't be resolved: fail toward
+    // warning and count every other session, as R4 did before scoping.
+    const anyUnknown = matched.some(m => m.affected === null);
+    const reach = new Set(matched.flatMap(m => (m.affected ? [...m.affected] : [])));
+    const others = getOtherSessions(sessionId)
+      .filter(s => anyUnknown || reach.has(canonicalPath(s.toplevel)));
     if (others.length > 0) {
       const sessionList = others
-        .map(s => `  - session ${s.session_id.slice(0, 8)}... on branch "${s.branch}"`)
+        .map(s => `  - session ${s.session_id.slice(0, 8)}... on branch "${s.branch}" (${s.toplevel})`)
         .join('\n');
       const labels = matched.map(m => `"${m.label}"`).join(', ');
       const notes = matched
@@ -984,10 +1092,10 @@ function handleBash(command, sessionId) {
       warnings.push(
         `[GIT GUARD WARNING — OTHER SESSIONS ACTIVE]\n` +
         'DO NOT STEAMROLL GIT-GUARD!\n' +
-        `You are about to run ${labels} but there are ${others.length} other active session(s):\n` +
+        `You are about to run ${labels} but ${others.length} other active session(s) work where it reaches:\n` +
         `${sessionList}\n` +
         notes +
-        `This command will affect their working tree. Proceed with caution.`
+        `This command will affect their work. Proceed with caution.`
       );
     }
   }

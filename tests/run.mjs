@@ -161,7 +161,74 @@ test('R1: GIT_GUARD_PROTECTED_BRANCHES=master blocks edit on master', () => {
   }
 });
 
+test('R1: Write into a not-yet-existing directory on main is blocked', () => {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'main');
+    const r = runHook(
+      { tool_name: 'Write', tool_input: { file_path: path.join(repo, 'new', 'deeper', 'x.md') }, session_id: 'r1-newdir' },
+      { GIT_GUARD_STATE_DIR: state }
+    );
+    assert(r.code === 2, `expected exit 2, got ${r.code}; stderr: ${r.stderr}`);
+    assert(r.stderr.includes('R1 BLOCKED'), 'expected R1 BLOCKED');
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('fail-open: Write into a new directory outside any repo', () => {
+  const dir = tmpDir('cggn-');
+  const state = tmpDir('cggs-');
+  try {
+    const r = runHook(
+      { tool_name: 'Write', tool_input: { file_path: path.join(dir, 'a', 'b.md') }, session_id: 'no-git-newdir' },
+      { GIT_GUARD_STATE_DIR: state }
+    );
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(dir);
+    cleanup(state);
+  }
+});
+
+test('R2: every allowed edit refreshes the session\'s recorded_at', () => {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'feat/x');
+    const payload = { tool_name: 'Edit', tool_input: { file_path: path.join(repo, 'a.md') }, session_id: 'refresh' };
+    assert(runHook(payload, { GIT_GUARD_STATE_DIR: state }).code === 0, 'first edit should pass');
+    const [file] = fs.readdirSync(state).filter(f => f.startsWith('refresh-'));
+    const fp = path.join(state, file);
+    const data = JSON.parse(fs.readFileSync(fp, 'utf-8'));
+    data.recorded_at = Date.now() - 23 * 60 * 60 * 1000;
+    fs.writeFileSync(fp, JSON.stringify(data));
+    assert(runHook(payload, { GIT_GUARD_STATE_DIR: state }).code === 0, 'second edit should pass');
+    const after = JSON.parse(fs.readFileSync(fp, 'utf-8'));
+    assert(Date.now() - after.recorded_at < 60_000, `expected refreshed recorded_at, got ${after.recorded_at}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
 // --- R1b (shared checkout: tracked files only) ---
+
+test('R1b: Write into a new directory on a shared checkout is allowed', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    const r = runHook(
+      { tool_name: 'Write', tool_input: { file_path: path.join(repo, 'docs', 'research', 'note.md') }, session_id: 'me' },
+      { GIT_GUARD_STATE_DIR: state }
+    );
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
 
 test('R1b: tracked file on a shared checkout is blocked', () => {
   const { repo, state } = sharedCheckout();
@@ -556,6 +623,58 @@ test('R0: cd to a case-variant path of the same repo is allowed (case-insensitiv
   }
 });
 
+// R0 across every cd in a command. Two sibling repos under one parent, plus
+// a non-repo dir; HOME points at the parent so `~` is testable.
+function r0Fixture() {
+  const parent = tmpDir('cggp-');
+  const here = path.join(parent, 'here');
+  const there = path.join(parent, 'there');
+  const plain = path.join(parent, 'plain');
+  for (const d of [here, there, plain]) fs.mkdirSync(d);
+  initRepo(here, 'feat/here');
+  initRepo(there, 'feat/there');
+  const state = tmpDir('cggs-');
+  const run = command => runHook(
+    { tool_name: 'Bash', tool_input: { command }, session_id: 'r0-multi' },
+    { GIT_GUARD_STATE_DIR: state, HOME: parent },
+    here
+  );
+  return { parent, here, there, plain, state, run };
+}
+
+const R0_CASES = [
+  // [command (placeholders {there} {plain}), expected exit]
+  ['cd ~/there && git status', 2],
+  ['cd ~', 0],
+  ['cd', 0],
+  ['ls && cd {there}', 2],
+  ['cd {plain} && cd {there}', 2],
+  ['cd {plain}; cd ../there', 2],
+  ['git status\ncd {there}', 2],
+  ['pushd {there}', 2],
+  ['cd .. && cd there', 2],
+  ['cd .. && cd here', 0],
+  ['(cd {there} && git status)', 0],
+  ['cd "~/there"', 0], // quoted: no tilde expansion, literal ./~/there doesn't exist
+  ['cd $SOMEWHERE && cd there', 0],
+  ['cd - && cd there', 0],
+];
+
+for (const [command, expected] of R0_CASES) {
+  test(`R0: "${command.replace('\n', '\\n')}" → exit ${expected}`, () => {
+    const f = r0Fixture();
+    try {
+      const cmd = command.replaceAll('{there}', f.there).replaceAll('{plain}', f.plain);
+      const r = f.run(cmd);
+      assert(r.code === expected, `expected exit ${expected}, got ${r.code}; stderr: ${r.stderr}`);
+      if (expected === 2) assert(r.stderr.includes('R0 BLOCKED'), 'expected R0 BLOCKED');
+    } finally {
+      cleanup(f.parent);
+      cleanup(f.state);
+    }
+  });
+}
+
 // --- R3 (warning via JSON output) ---
 
 test('R3: push to protected branch emits allow+reason JSON', () => {
@@ -776,6 +895,60 @@ test('R4: chained add -A && commit -a names both commands', () => {
   const text = warningText(r);
   assert(text.includes('"git add -A"') && text.includes('"git commit -a"'), `expected both labels, got: ${text}`);
 });
+
+test('R4: read-only stash subcommands do not warn', () => {
+  for (const cmd of ['git stash list', 'git stash show -p', 'git stash create']) {
+    const r = r4Run(cmd);
+    assert(!warningText(r).includes('OTHER SESSIONS ACTIVE'), `unexpected warning for ${cmd}: ${r.stdout}`);
+  }
+});
+
+// Scoping: two repos and a worktree. The "other" session lives at `where`.
+function r4Scoped(otherAt, command) {
+  const repo = tmpDir('cggt-');
+  const elsewhere = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'feat/x');
+    initRepo(elsewhere, 'feat/y');
+    const wt = addWorktree(repo, 'feat/wt', 'wt');
+    const where = { repo, elsewhere, wt }[otherAt];
+    fakeOtherSession(state, where);
+    const cmd = command.replaceAll('{elsewhere}', elsewhere).replaceAll('{wt}', wt);
+    return runHook(
+      { tool_name: 'Bash', tool_input: { command: cmd }, session_id: 'me' },
+      { GIT_GUARD_STATE_DIR: state },
+      repo
+    );
+  } finally {
+    cleanup(repo);
+    cleanup(elsewhere);
+    cleanup(state);
+  }
+}
+
+const R4_SCOPE_CASES = [
+  // [other session at, command, warns?]
+  ['repo', 'git add -A', true],
+  ['elsewhere', 'git add -A', false],
+  ['elsewhere', 'git checkout feat/z', false],
+  ['wt', 'git add -A', false],
+  ['wt', 'git clean -fd', false],
+  ['wt', 'git stash pop', true],
+  ['wt', 'git stash drop', true],
+  ['elsewhere', 'git stash pop', false],
+  ['elsewhere', 'git -C {elsewhere} add -A', true],
+  ['wt', 'git -C {wt} reset --hard', true],
+];
+
+for (const [at, command, warns] of R4_SCOPE_CASES) {
+  test(`R4 scope: other session in ${at}, "${command.replace(/\{\w+\}/g, '<path>')}" ${warns ? 'warns' : 'is silent'}`, () => {
+    const r = r4Scoped(at, command);
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+    const got = warningText(r).includes('OTHER SESSIONS ACTIVE');
+    assert(got === warns, `expected warns=${warns}, got stdout: ${r.stdout}`);
+  });
+}
 
 test('R4: no warning when no other session is active', () => {
   const r = r4Run('git add -A', false);

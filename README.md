@@ -10,12 +10,12 @@ Derived from a hook that's been in production for three months inside a personal
 
 | Rule | Path | Behaviour | What it prevents |
 |---|---|---|---|
-| **R0** | Bash | Block | `cd <different-repo>` — prevents subsequent git commands operating on the wrong repo. Moving between the repo's own worktrees is allowed. |
+| **R0** | Bash | Block | `cd`/`pushd` into a different repo — prevents subsequent git commands operating on the wrong repo. Every `cd` in the command is checked, `~` included. Moving between the repo's own worktrees is allowed. |
 | **R1** | Edit/Write | Block | Edits on a protected branch (default: `main`, `master`) |
 | **R1b** | Edit/Write | Block | Edits to **tracked** files when other sessions are on the same (non-worktree) checkout — forces worktrees. New untracked and gitignored files are allowed. |
 | **R2** | Edit/Write | Block | Edits after another session switched branches underneath you |
 | **R3** | Bash | Warn | `git push` targeting a protected branch |
-| **R4** | Bash | Warn | When other sessions are active: destructive verbs (`stash`, `checkout`, `switch`, `reset --hard`) and commands that sweep up their files (`add -A`/`-u`/`.`, `commit -a`/`.`, `clean`, `stash -u`) |
+| **R4** | Bash | Warn | When other sessions work where the command reaches: destructive verbs (`stash`, `checkout`, `switch`, `reset --hard`) and commands that sweep up their files (`add -A`/`-u`/`.`, `commit -a`/`.`, `clean`, `stash -u`) |
 | **R5** | Bash | Block | `git pull <remote> <wrong-ref>` — the silent pointer-move that can cost commits of drift |
 
 Blocks emit `[git-guard R<n> BLOCKED]` on stderr with a recovery message. Warnings emit JSON with `permissionDecision: "allow"` so the warning text reaches Claude without blocking the tool call.
@@ -72,6 +72,10 @@ To disable the hook, remove its entry from `settings.json` — there is delibera
 
 A session whose edits on a checkout have all been to untracked files is marked `untracked_only` in its state file. R1b ignores such sessions, so a session that writes a draft never locks the main session out of its tracked files; R4 still counts them, so the main session is warned before an `add -A`, `clean` or `stash -u` that would sweep the draft up. The first tracked edit clears the mark.
 
+**Who R4 warns about.** Only sessions the command can reach: those on the same checkout for `add`, `commit`, `clean`, `stash push`, `checkout`, `switch` and `reset`, which only touch the working tree they run in; and those on any worktree of the same repo for `stash pop`/`drop`/`clear`/`store`/`branch`, because the stash list is shared. Sessions on other repos are not listed. If the target can't be resolved, R4 counts everyone. Read-only `stash list`/`show` don't warn.
+
+**Session expiry.** A session's state file is rewritten on every allowed edit, so it expires 24 hours after its *last* edit.
+
 **Same repo, by common git dir (R0).** Every worktree has its own toplevel but shares the repo's common git dir, so R0 compares common dirs. `cd` between the main checkout and its worktrees is allowed; `cd` into a different repo is blocked.
 
 **Fail-open by default.** Parse errors, missing git context, unreadable state files — the hook exits 0 and allows the tool call. Two exceptions fail CLOSED: R5, on branch-lookup failure while a pull command is detected, because a silent pointer-move is precisely what R5 exists to prevent; and R1b, when another session is active and the trackedness check errors, because it can't prove the file is safe to edit.
@@ -90,8 +94,8 @@ A session whose edits on a checkout have all been to untracked files is marked `
 - **Developed and tested on macOS and Linux.** POSIX paths assumed. Windows contributors welcome.
 - **`GIT_GUARD_PROTECTED_BRANCHES` is a literal list**, not a glob. If you use `release/*` style branches, list them explicitly.
 - **Shell writes bypass R1/R1b/R2.** See above: only the Edit and Write tools are inspected.
-- **R4 is a warning, and string-level.** It parses `git` invocations (including `-C <path>`, `--work-tree=`, `--git-dir=`), not aliases, shell functions or dynamically built commands. It counts every other active session, including ones on other repos.
-- **Edit/Write into a directory that doesn't exist yet fails open** for all Edit/Write rules, because the branch is resolved from the file's directory.
+- **R4 is a warning, and string-level.** It parses `git` invocations (including `-C <path>`, `--work-tree=`, `--git-dir=`), not aliases, shell functions or dynamically built commands.
+- **Sessions are known only through their Edit/Write calls.** A session that has only run Bash commands isn't registered, and a session that ended keeps counting until its state expires (24 hours after its last edit).
 - **R1b is bypass-able via worktrees**, which is the point — the worktree IS the fix, not a workaround.
 
 ## Testing
@@ -109,6 +113,10 @@ The harness spawns the hook as a subprocess with controlled stdin, asserts exit 
 - Bash parsing: shell-boundary characters inside quotes (`-m "feat(x): y"`) no longer end a git invocation early.
 - R4 also warns on commands that sweep up other sessions' files: `git add -A`/`--all`/`-u`/`.`, `git commit -a`/`.`, `git clean` (not dry runs), `git stash -u`/`--include-untracked`/`--all`. All matches in a chained command are named. `git reset -q --hard` (flag not first) is now caught.
 - R0 decides "different repo" by the common git dir, so `cd` into the repo's own worktrees is no longer blocked. Paths are canonicalized with native realpath, so case-variant spellings on macOS read as the same repo.
+- R4 warns only about sessions the command can reach (same checkout, or same repo for the shared stash list), not every session on the machine. `stash list`/`show`/`create` no longer warn.
+- R1/R1b/R2: a Write into a directory that doesn't exist yet no longer fails the hook open (it skipped R1 on `main`).
+- R0 checks every `cd`/`pushd` in a command, in order, including `~`, `~/…` and newline-separated commands; previously only the first `cd`, and never `~`.
+- Session state is refreshed on every edit, so a session running more than a day no longer drops out.
 - Docs: the Edit/Write rules do not see shell writes; corrected the stale claim that `git -C <path> pull` is out of R5's scope.
 
 **0.1.0** — initial release.
