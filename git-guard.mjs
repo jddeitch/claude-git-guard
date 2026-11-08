@@ -6,17 +6,26 @@
 //
 // Edit|Write path — Hard gates:
 //   R1   Block edits on a protected branch
-//   R1b  Block shared-checkout edits (force other sessions into worktrees)
+//   R1b  Block edits to TRACKED files on a shared (non-worktree) checkout
+//        while other sessions are active on it. Untracked and gitignored
+//        files are allowed. Fails closed if trackedness can't be checked.
 //   R2   Block if branch drifted since session start
 //
 // Bash path — mixed:
-//   R0   BLOCK cd to a different git repo
+//   R0   BLOCK cd to a different git repo (by common git dir, so cd into
+//        the repo's own worktrees is allowed)
 //   R3   WARN before `git push` targeting a protected branch
 //   R5   BLOCK `git pull <remote> <ref>` on ANY branch when ref differs
 //        from the current branch name. Override via
 //        GIT_GUARD_ALLOW_POINTER_MOVE=1 prefix.
-//   R4   WARN on destructive verbs (stash/checkout/switch/reset --hard)
-//        when other sessions are active
+//   R4   WARN when other sessions are active on destructive verbs
+//        (stash, checkout, switch, reset --hard) and on commands that
+//        sweep up other sessions' files (add -A/-u/., commit -a/., clean,
+//        stash -u)
+//
+// The Edit|Write rules see ONLY the Edit and Write tools. Files written from
+// the shell (`cp`, `mv`, `cat > f`, `sed -i`, `tee`, a script) are invisible
+// to R1/R1b/R2 — the Bash path inspects git commands, not shell writes.
 //
 // R3/R4/R5 are worktree-aware for `git -C <path> <verb>` and the equivalent
 // `--git-dir=<path>`, `--work-tree=<path>` global-option forms: the branch
@@ -362,7 +371,7 @@ function extractCdTarget(command) {
  * Canonicalize a path: resolve symlinks and, on case-insensitive filesystems
  * (macOS default), the on-disk case. Uses the native realpath(3) — Node's JS
  * `fs.realpathSync` resolves symlinks but keeps the caller's case, so
- * `/Users/jd/projects` and `/Users/jd/Projects` would read as two paths.
+ * `~/projects/app` and `~/Projects/app` would read as two paths.
  * Returns the input unchanged if it can't be resolved (e.g. doesn't exist).
  */
 function canonicalPath(p) {

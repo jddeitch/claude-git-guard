@@ -1,6 +1,6 @@
 {
   "name": "claude-git-guard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Claude Code PreToolUse hook that blocks multi-agent branch accidents — edits on protected branches, cross-session drift, cross-repo cd, pull pointer moves.",
   "main": "git-guard.mjs",
   "type": "module",

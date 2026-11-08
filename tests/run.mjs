@@ -497,6 +497,29 @@ test('R5: pull wrong ref is blocked', () => {
   }
 });
 
+test('R5: git -C <path> pull wrong ref is blocked (branch read at <path>)', () => {
+  const repo = tmpDir('cggt-');
+  const elsewhere = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'feat/x');
+    initRepo(elsewhere, 'feat/y');
+    // Hook CWD is on feat/y; the -C target is on feat/x. Pulling feat/y
+    // into the -C target is a pointer move even though it matches the CWD.
+    const r = runHook(
+      { tool_name: 'Bash', tool_input: { command: `git -C ${repo} pull origin feat/y` }, session_id: 'r5-C' },
+      { GIT_GUARD_STATE_DIR: state },
+      elsewhere
+    );
+    assert(r.code === 2, `expected exit 2, got ${r.code}; stderr: ${r.stderr}`);
+    assert(r.stderr.includes('R5 BLOCKED'), 'expected R5 BLOCKED');
+  } finally {
+    cleanup(repo);
+    cleanup(elsewhere);
+    cleanup(state);
+  }
+});
+
 test('R5: override prefix allows pull wrong ref', () => {
   const repo = tmpDir('cggt-');
   const state = tmpDir('cggs-');
