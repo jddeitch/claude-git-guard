@@ -70,6 +70,8 @@ To disable the hook, remove its entry from `settings.json` — there is delibera
 
 **Shared checkouts (R1b).** When another session's state file names the same non-worktree checkout, the hook asks git whether the file being edited is in the index (`git ls-files`, committed or staged). Only tracked files are blocked: those are what another session's stash, reset, checkout or commit will clobber or sweep up. A new draft or a gitignored scratch file is untouched by all of those, so it is allowed. The path is canonicalized first, so a symlink to a tracked file, or a case-variant name on macOS, still counts as tracked. The commands that *do* catch untracked files are covered by R4 instead.
 
+A session whose edits on a checkout have all been to untracked files is marked `untracked_only` in its state file. R1b ignores such sessions, so a session that writes a draft never locks the main session out of its tracked files; R4 still counts them, so the main session is warned before an `add -A`, `clean` or `stash -u` that would sweep the draft up. The first tracked edit clears the mark.
+
 **Same repo, by common git dir (R0).** Every worktree has its own toplevel but shares the repo's common git dir, so R0 compares common dirs. `cd` between the main checkout and its worktrees is allowed; `cd` into a different repo is blocked.
 
 **Fail-open by default.** Parse errors, missing git context, unreadable state files — the hook exits 0 and allows the tool call. Two exceptions fail CLOSED: R5, on branch-lookup failure while a pull command is detected, because a silent pointer-move is precisely what R5 exists to prevent; and R1b, when another session is active and the trackedness check errors, because it can't prove the file is safe to edit.
@@ -103,7 +105,8 @@ The harness spawns the hook as a subprocess with controlled stdin, asserts exit 
 ## Changelog
 
 **0.2.0**
-- R1b blocks only edits to files git tracks (committed or staged). New untracked and gitignored files are allowed on a shared checkout. Fails closed if the check errors.
+- R1b blocks only edits to files git tracks (committed or staged). New untracked and gitignored files are allowed on a shared checkout. Fails closed if the check errors. Sessions that have only touched untracked files don't count toward R1b, so they can't lock out the session doing tracked work.
+- Bash parsing: shell-boundary characters inside quotes (`-m "feat(x): y"`) no longer end a git invocation early.
 - R4 also warns on commands that sweep up other sessions' files: `git add -A`/`--all`/`-u`/`.`, `git commit -a`/`.`, `git clean` (not dry runs), `git stash -u`/`--include-untracked`/`--all`. All matches in a chained command are named. `git reset -q --hard` (flag not first) is now caught.
 - R0 decides "different repo" by the common git dir, so `cd` into the repo's own worktrees is no longer blocked. Paths are canonicalized with native realpath, so case-variant spellings on macOS read as the same repo.
 - Docs: the Edit/Write rules do not see shell writes; corrected the stale claim that `git -C <path> pull` is out of R5's scope.

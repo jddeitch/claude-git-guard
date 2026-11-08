@@ -326,6 +326,110 @@ test('R1b: tracked file in a worktree is allowed even with other sessions active
   }
 });
 
+// R1b with real sessions (no faked state): the order of edits matters.
+function plainRepo() {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  initRepo(repo, 'feat/shared');
+  fs.writeFileSync(path.join(repo, 'README.md'), 'tracked\n');
+  git(repo, 'add', 'README.md');
+  git(repo, 'commit', '-q', '-m', 'files');
+  const edit = (sessionId, file, tool = 'Edit') => runHook(
+    { tool_name: tool, tool_input: { file_path: path.join(repo, file) }, session_id: sessionId },
+    { GIT_GUARD_STATE_DIR: state }
+  );
+  return { repo, state, edit };
+}
+
+test('R1b: a session that only wrote drafts does not lock out the main session', () => {
+  const { repo, state, edit } = plainRepo();
+  try {
+    assert(edit('session-A', 'README.md').code === 0, 'A first tracked edit should pass');
+    assert(edit('session-B', 'draft.md', 'Write').code === 0, 'B draft should pass');
+    const r = edit('session-A', 'README.md');
+    assert(r.code === 0, `A should not be blocked by a draft-only session; got ${r.code}: ${r.stderr}`);
+    const rb = edit('session-B', 'README.md');
+    assert(rb.code === 2 && rb.stderr.includes('R1b BLOCKED'), 'B tracked edit should still be blocked by A');
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: draft-only session that started first does not block a later tracked editor', () => {
+  const { repo, state, edit } = plainRepo();
+  try {
+    assert(edit('session-B', 'draft.md', 'Write').code === 0, 'B draft should pass');
+    const r = edit('session-A', 'README.md');
+    assert(r.code === 0, `A should pass; got ${r.code}: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: once a session edits a tracked file it counts as a tracked editor', () => {
+  const { repo, state, edit } = plainRepo();
+  try {
+    assert(edit('session-B', 'draft.md', 'Write').code === 0, 'B draft should pass');
+    assert(edit('session-B', 'README.md').code === 0, 'B tracked edit (alone) should pass');
+    const r = edit('session-A', 'README.md');
+    assert(r.code === 2 && r.stderr.includes('R1b BLOCKED'), `A should now be blocked by B; got ${r.code}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R4: a draft-only session still counts for sweeping-command warnings', () => {
+  const { repo, state, edit } = plainRepo();
+  try {
+    assert(edit('session-B', 'draft.md', 'Write').code === 0, 'B draft should pass');
+    const r = runHook(
+      { tool_name: 'Bash', tool_input: { command: 'git add -A' }, session_id: 'session-A' },
+      { GIT_GUARD_STATE_DIR: state },
+      repo
+    );
+    assert(warningText(r).includes('"git add -A"'), `expected R4 warning naming B's presence, got: ${r.stdout}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: gitignored symlink pointing outside the checkout is allowed', () => {
+  const { repo, state } = sharedCheckout();
+  const outside = tmpDir('cggo-');
+  try {
+    fs.writeFileSync(path.join(outside, 'secret.env'), 'X=1\n');
+    fs.mkdirSync(path.join(repo, 'ignored'));
+    fs.symlinkSync(path.join(outside, 'secret.env'), path.join(repo, 'ignored', 'app.env'));
+    const r = runHook(editPayload(path.join(repo, 'ignored', 'app.env')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+    cleanup(outside);
+  }
+});
+
+test('R1b: tracked symlink pointing outside the checkout is blocked', () => {
+  const { repo, state } = sharedCheckout();
+  const outside = tmpDir('cggo-');
+  try {
+    fs.writeFileSync(path.join(outside, 'shared.md'), 'x\n');
+    fs.symlinkSync(path.join(outside, 'shared.md'), path.join(repo, 'shared.md'));
+    git(repo, 'add', 'shared.md');
+    const r = runHook(editPayload(path.join(repo, 'shared.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 2, `expected exit 2, got ${r.code}; stderr: ${r.stderr}`);
+    assert(r.stderr.includes('is tracked by git'), `expected tracked reason, got: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+    cleanup(outside);
+  }
+});
+
 // --- R0 ---
 
 test('R0: cd to a different repo is blocked', () => {
@@ -477,6 +581,23 @@ test('R3: push to protected branch emits allow+reason JSON', () => {
   }
 });
 
+test('R3: push after a quoted message with shell-boundary chars still warns', () => {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'feat/test');
+    const r = runHook(
+      { tool_name: 'Bash', tool_input: { command: 'git commit -m "fix (a; b)" && git push origin main' }, session_id: 'r3-q' },
+      { GIT_GUARD_STATE_DIR: state },
+      repo
+    );
+    assert(warningText(r).includes('PROTECTED BRANCH PUSH'), `expected R3 warning, got: ${r.stdout}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
 // --- R5 ---
 
 test('R5: pull wrong ref is blocked', () => {
@@ -570,6 +691,10 @@ const R4_WARN_CASES = [
   ['commit --all -m msg', 'git commit -a'],
   ['commit -am "msg"', 'git commit -a'],
   ['commit -m msg .', 'git commit .'],
+  // Quoted shell-boundary chars must not end the invocation early.
+  ['commit -m "feat(x): y" -a', 'git commit -a'],
+  ["commit -m 'a; b && c' -a", 'git commit -a'],
+  ['commit -m "say \\"hi\\" (x)" -a', 'git commit -a'],
   ['clean -fd', 'git clean'],
   ['clean -f -x', 'git clean'],
   ['stash -u', 'git stash -u'],

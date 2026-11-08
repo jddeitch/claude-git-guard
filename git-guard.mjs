@@ -151,13 +151,19 @@ function readSessionState(key) {
   }
 }
 
-function writeSessionState(key, branch, sessionId, toplevel) {
+// `untrackedOnly`: true while every Edit/Write this session has made on this
+// checkout was PROVEN to target an untracked/ignored file. R1b ignores such
+// sessions (a draft-writer must not lock the main session out of tracked
+// files); R4 still counts them (their drafts are what add -A/clean sweep).
+// State files without the field (older versions) read as false.
+function writeSessionState(key, branch, sessionId, toplevel, untrackedOnly) {
   try {
     const fp = path.join(STATE_DIR, `${key}.json`);
     fs.writeFileSync(fp, JSON.stringify({
       branch,
       session_id: sessionId,
       toplevel,
+      untracked_only: untrackedOnly === true,
       recorded_at: Date.now(),
     }));
   } catch {
@@ -225,20 +231,30 @@ function firstLine(err) {
  *
  * `--literal-pathspecs` stops `*`, `?`, `[` in a file name being read as a
  * glob that matches other, tracked files. The pathspec is absolute, so git
- * itself errors (→ fail closed) if it resolves outside this checkout.
+ * itself errors (→ fail closed) if it still resolves outside this checkout.
  */
 function isTrackedPath(toplevel, filePath) {
   if (!filePath) throw new Error('no file path in tool input');
   const abs = path.resolve(filePath);
+  const top = canonicalPath(toplevel);
+  // The path itself, with only its directory canonicalized (keeps a
+  // symlink's own name; used when the file doesn't exist yet).
+  const lexical = path.join(canonicalPath(path.dirname(abs)), path.basename(abs));
   let canonical;
   try {
     canonical = fs.realpathSync.native(abs);
   } catch {
-    canonical = path.join(canonicalPath(path.dirname(abs)), path.basename(abs));
+    canonical = lexical;
+  }
+  // A symlink in this checkout pointing OUTSIDE it: the target is in no
+  // index of ours, so ask about the link itself (tracked link → blocked)
+  // rather than hand git an out-of-repo path it would refuse.
+  if (canonical !== top && !canonical.startsWith(top + path.sep)) {
+    canonical = lexical;
   }
   const out = execFileSync(
     'git',
-    ['-C', canonicalPath(toplevel), '--literal-pathspecs', 'ls-files', '-z', '--', canonical],
+    ['-C', top, '--literal-pathspecs', 'ls-files', '-z', '--', canonical],
     { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }
   );
   return out.length > 0;
@@ -280,18 +296,27 @@ function handleEditWrite(sessionId, filePath) {
   // gitignored file (a draft, a scratch note) isn't touched by any of those,
   // so blocking it only forces a worktree for no safety gain. The commands
   // that DO sweep untracked files (add -A, clean, stash -u) are R4's job.
+  //
+  // Trackedness is checked on every shared-checkout edit, even with no one
+  // else around, so the session's state records whether it has only ever
+  // touched untracked files. Only sessions that have edited tracked files
+  // count as "others" here — otherwise a session that wrote one draft would
+  // lock the session doing the real work out of its own tracked files.
+  let provenUntracked = false;
   if (!isWorktree) {
+    // Fail CLOSED: if trackedness can't be established, treat as tracked.
+    let tracked = true;
+    let checkError = null;
+    try {
+      tracked = isTrackedPath(toplevel, filePath);
+    } catch (e) {
+      checkError = e;
+    }
+    provenUntracked = !tracked;
+
     const othersOnSameToplevel = getOtherSessions(sessionId)
-      .filter(s => s.toplevel === toplevel);
+      .filter(s => s.toplevel === toplevel && s.untracked_only !== true);
     if (othersOnSameToplevel.length > 0) {
-      // Fail CLOSED: if trackedness can't be established, treat as tracked.
-      let tracked = true;
-      let checkError = null;
-      try {
-        tracked = isTrackedPath(toplevel, filePath);
-      } catch (e) {
-        checkError = e;
-      }
       if (tracked) {
         const sessionList = othersOnSameToplevel
           .map(s => `  - session ${s.session_id.slice(0, 8)}... on branch "${s.branch}"`)
@@ -320,12 +345,19 @@ function handleEditWrite(sessionId, filePath) {
   // R2: Branch drift detection
   const state = readSessionState(key);
 
+  // The marker only ever goes true → false: one tracked (or unprovable)
+  // edit makes this session a tracked-file editor for R1b from then on.
+  const untrackedOnly = provenUntracked && (!state || state.untracked_only === true);
+
   if (!state) {
-    writeSessionState(key, branch, sessionId, toplevel);
+    writeSessionState(key, branch, sessionId, toplevel, untrackedOnly);
     process.exit(0);
   }
 
   if (state.branch === branch) {
+    if (state.untracked_only === true && !untrackedOnly) {
+      writeSessionState(key, branch, sessionId, toplevel, false);
+    }
     process.exit(0);
   }
 
@@ -335,7 +367,7 @@ function handleEditWrite(sessionId, filePath) {
       encoding: 'utf-8', timeout: 5000, stdio: 'pipe',
     });
   } catch {
-    writeSessionState(key, branch, sessionId, toplevel);
+    writeSessionState(key, branch, sessionId, toplevel, untrackedOnly);
     process.exit(0);
   }
 
@@ -488,12 +520,26 @@ function parseLeadingEnvVars(command) {
  * single-quoted, and unquoted forms. Unquoted tokens terminate at whitespace
  * or shell-boundary characters. Returns [value, nextPos].
  */
+/**
+ * Index of the quote closing the one at `pos`, or -1 if unterminated.
+ * Inside double quotes a backslash escapes the next char (`"say \"hi\""`);
+ * single quotes have no escapes, as in POSIX sh.
+ */
+function closingQuote(command, pos) {
+  const q = command[pos];
+  for (let i = pos + 1; i < command.length; i++) {
+    if (q === '"' && command[i] === '\\') { i++; continue; }
+    if (command[i] === q) return i;
+  }
+  return -1;
+}
+
 function readShellToken(command, pos) {
   if (pos >= command.length) return [null, pos];
   const first = command[pos];
   if (first === '"' || first === "'") {
     const start = pos + 1;
-    const endIdx = command.indexOf(first, start);
+    const endIdx = closingQuote(command, pos);
     if (endIdx === -1) return [null, command.length];
     return [command.slice(start, endIdx), endIdx + 1];
   }
@@ -592,8 +638,17 @@ function extractGitInvocations(command) {
     const subcommand = command.slice(subStart, pos);
     if (!subcommand) continue;
 
+    // Scan to the next shell boundary OUTSIDE quotes, so a quoted
+    // `-m "feat(x): y; z"` doesn't end the invocation and hide later flags.
     const restStart = pos;
-    while (pos < command.length && !/[;&|()`]/.test(command[pos])) pos++;
+    while (pos < command.length && !/[;&|()`]/.test(command[pos])) {
+      if (command[pos] === '"' || command[pos] === "'") {
+        const end = closingQuote(command, pos);
+        pos = end === -1 ? command.length : end + 1;
+        continue;
+      }
+      pos++;
+    }
     const rest = command.slice(restStart, pos).trim();
 
     invocations.push({ cPath, subcommand, rest });
@@ -731,8 +786,11 @@ const SWEEPS_TRACKED = 'sweeps other sessions\' uncommitted changes to tracked f
  *   stash push/save -u/--include-untracked/-a/--all (labelled specially;
  *   plain stash already warns)
  */
+const R4_SUBCOMMANDS = new Set(['reset', 'checkout', 'switch', 'add', 'commit', 'clean', 'stash']);
+
 function classifyR4(inv) {
   const { subcommand, rest } = inv;
+  if (!R4_SUBCOMMANDS.has(subcommand)) return null;
   const tokens = tokenizeArgs(rest);
 
   if (subcommand === 'reset') {
