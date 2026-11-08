@@ -195,6 +195,46 @@ function emitWarning(reason) {
   process.stdout.write(JSON.stringify(output));
 }
 
+function firstLine(err) {
+  const text = String(err?.stderr || err?.message || err).trim();
+  return text.split('\n')[0];
+}
+
+/**
+ * Is `filePath` known to git's index in the checkout at `toplevel`?
+ * Returns true/false; THROWS if it can't tell (R1b treats that as tracked).
+ *
+ * "Tracked" means present in the index — committed files and staged new
+ * files alike, since both are what stash/reset/checkout act on. Untracked
+ * and gitignored files are not in the index and return false (a
+ * force-added ignored file IS in the index and returns true).
+ *
+ * The path is canonicalized first (symlinks and on-disk case). Without
+ * that, on macOS an Edit of `readme.md` would modify the tracked
+ * `README.md` while `ls-files readme.md` reports it untracked. A path that
+ * doesn't exist yet keeps its basename and canonicalizes its directory.
+ *
+ * `--literal-pathspecs` stops `*`, `?`, `[` in a file name being read as a
+ * glob that matches other, tracked files. The pathspec is absolute, so git
+ * itself errors (→ fail closed) if it resolves outside this checkout.
+ */
+function isTrackedPath(toplevel, filePath) {
+  if (!filePath) throw new Error('no file path in tool input');
+  const abs = path.resolve(filePath);
+  let canonical;
+  try {
+    canonical = fs.realpathSync.native(abs);
+  } catch {
+    canonical = path.join(canonicalPath(path.dirname(abs)), path.basename(abs));
+  }
+  const out = execFileSync(
+    'git',
+    ['-C', canonicalPath(toplevel), '--literal-pathspecs', 'ls-files', '-z', '--', canonical],
+    { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }
+  );
+  return out.length > 0;
+}
+
 function handleEditWrite(sessionId, filePath) {
   const { toplevel, branch } = resolveGitContext(filePath);
   const key = sessionKey(sessionId, toplevel);
@@ -226,23 +266,45 @@ function handleEditWrite(sessionId, filePath) {
     }
   })();
 
+  // Only TRACKED files are blocked: those are what another session's stash,
+  // reset, checkout or commit will clobber or sweep up. A new untracked or
+  // gitignored file (a draft, a scratch note) isn't touched by any of those,
+  // so blocking it only forces a worktree for no safety gain. The commands
+  // that DO sweep untracked files (add -A, clean, stash -u) are R4's job.
   if (!isWorktree) {
     const othersOnSameToplevel = getOtherSessions(sessionId)
       .filter(s => s.toplevel === toplevel);
     if (othersOnSameToplevel.length > 0) {
-      const sessionList = othersOnSameToplevel
-        .map(s => `  - session ${s.session_id.slice(0, 8)}... on branch "${s.branch}"`)
-        .join('\n');
-      process.stderr.write(
-        `[git-guard R1b BLOCKED] ${othersOnSameToplevel.length} other session(s) active on this checkout:\n` +
-        `${sessionList}\n\n` +
-        'DO NOT STEAMROLL GIT-GUARD!\n' +
-        'Multiple agents on the same checkout cause branch collisions.\n' +
-        'Use your agent\'s worktree tool, or `git worktree add -b feat/<name> .worktrees/<name>`.\n' +
-        'Do NOT just create a branch in place — that moves every session listed above onto your branch.\n' +
-        'Do NOT delete state files or work around this.\n'
-      );
-      process.exit(2);
+      // Fail CLOSED: if trackedness can't be established, treat as tracked.
+      let tracked = true;
+      let checkError = null;
+      try {
+        tracked = isTrackedPath(toplevel, filePath);
+      } catch (e) {
+        checkError = e;
+      }
+      if (tracked) {
+        const sessionList = othersOnSameToplevel
+          .map(s => `  - session ${s.session_id.slice(0, 8)}... on branch "${s.branch}"`)
+          .join('\n');
+        const reason = checkError
+          ? `Could not determine whether ${filePath ?? '(no file path)'} is tracked by git — failing closed.\n` +
+            `  ${firstLine(checkError)}\n`
+          : `${filePath} is tracked by git.\n`;
+        process.stderr.write(
+          `[git-guard R1b BLOCKED] ${reason}` +
+          `${othersOnSameToplevel.length} other session(s) active on this checkout:\n` +
+          `${sessionList}\n\n` +
+          'DO NOT STEAMROLL GIT-GUARD!\n' +
+          'Edits to tracked files on a shared checkout collide: another session\'s stash, reset,\n' +
+          'checkout or commit will sweep up or clobber your change (and yours will theirs).\n' +
+          'New untracked or gitignored files are allowed here; tracked files need a worktree.\n' +
+          'Use your agent\'s worktree tool, or `git worktree add -b feat/<name> .worktrees/<name>`.\n' +
+          'Do NOT just create a branch in place — that moves every session listed above onto your branch.\n' +
+          'Do NOT delete state files or work around this.\n'
+        );
+        process.exit(2);
+      }
     }
   }
 

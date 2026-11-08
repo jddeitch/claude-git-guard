@@ -68,6 +68,47 @@ function assert(cond, msg) {
   if (!cond) throw new Error(msg);
 }
 
+function git(repo, ...args) {
+  const r = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf-8', stdio: 'pipe' });
+  if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr}`);
+  return r.stdout.trim();
+}
+
+// Fake another active session by writing its state file, exactly as the
+// hook would after that session's first Edit/Write on `repo`.
+function fakeOtherSession(stateDir, repo, sessionId = 'other-session-0001') {
+  const toplevel = git(repo, 'rev-parse', '--show-toplevel');
+  const branch = git(repo, 'rev-parse', '--abbrev-ref', 'HEAD');
+  fs.writeFileSync(
+    path.join(stateDir, `${sessionId}-fake.json`),
+    JSON.stringify({ branch, session_id: sessionId, toplevel, recorded_at: Date.now() })
+  );
+}
+
+// A repo on a feature branch with one committed file and a .gitignore,
+// plus a state dir in which another session is active on the same checkout.
+function sharedCheckout() {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  initRepo(repo, 'feat/shared');
+  fs.writeFileSync(path.join(repo, 'README.md'), 'tracked\n');
+  fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored/\n*.log\n');
+  git(repo, 'add', 'README.md', '.gitignore');
+  git(repo, 'commit', '-q', '-m', 'files');
+  fakeOtherSession(state, repo);
+  return { repo, state };
+}
+
+function editPayload(filePath, sessionId = 'me') {
+  return { tool_name: 'Edit', tool_input: { file_path: filePath }, session_id: sessionId };
+}
+
+// R4 warnings arrive as stdout JSON; return the reason text ('' if none).
+function warningText(r) {
+  if (!r.stdout) return '';
+  return JSON.parse(r.stdout).hookSpecificOutput?.permissionDecisionReason || '';
+}
+
 // --- R1 ---
 
 test('R1: edit on main is blocked', () => {
@@ -114,6 +155,171 @@ test('R1: GIT_GUARD_PROTECTED_BRANCHES=master blocks edit on master', () => {
     );
     assert(r.code === 2, `expected exit 2, got ${r.code}`);
     assert(r.stderr.includes('R1 BLOCKED'), 'expected R1 BLOCKED');
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+// --- R1b (shared checkout: tracked files only) ---
+
+test('R1b: tracked file on a shared checkout is blocked', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    const r = runHook(editPayload(path.join(repo, 'README.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 2, `expected exit 2, got ${r.code}`);
+    assert(r.stderr.includes('R1b BLOCKED'), 'expected R1b BLOCKED');
+    assert(r.stderr.includes('is tracked by git'), 'expected tracked reason');
+    assert(r.stderr.includes('other-se'), 'expected other session listed');
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: Write of a new untracked file on a shared checkout is allowed', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    fs.mkdirSync(path.join(repo, 'docs'));
+    const r = runHook(
+      { tool_name: 'Write', tool_input: { file_path: path.join(repo, 'docs', 'draft.md') }, session_id: 'me' },
+      { GIT_GUARD_STATE_DIR: state }
+    );
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: Edit of an existing untracked file on a shared checkout is allowed', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    fs.writeFileSync(path.join(repo, 'notes.md'), 'untracked\n');
+    const r = runHook(editPayload(path.join(repo, 'notes.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: gitignored file on a shared checkout is allowed', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    fs.mkdirSync(path.join(repo, 'ignored'));
+    fs.writeFileSync(path.join(repo, 'ignored', 'scratch.txt'), 'x\n');
+    const r1 = runHook(editPayload(path.join(repo, 'ignored', 'scratch.txt')), { GIT_GUARD_STATE_DIR: state });
+    assert(r1.code === 0, `ignored dir: expected exit 0, got ${r1.code}; stderr: ${r1.stderr}`);
+    const r2 = runHook(editPayload(path.join(repo, 'run.log')), { GIT_GUARD_STATE_DIR: state });
+    assert(r2.code === 0, `ignored glob: expected exit 0, got ${r2.code}; stderr: ${r2.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: staged-but-uncommitted file on a shared checkout is blocked', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    fs.writeFileSync(path.join(repo, 'staged.md'), 'new\n');
+    git(repo, 'add', 'staged.md');
+    const r = runHook(editPayload(path.join(repo, 'staged.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 2, `expected exit 2, got ${r.code}`);
+    assert(r.stderr.includes('R1b BLOCKED'), 'expected R1b BLOCKED');
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: force-added gitignored file is tracked and blocked', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    fs.writeFileSync(path.join(repo, 'keep.log'), 'x\n');
+    git(repo, 'add', '-f', 'keep.log');
+    const r = runHook(editPayload(path.join(repo, 'keep.log')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 2, `expected exit 2, got ${r.code}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: glob characters in an untracked name do not match tracked files', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    // Unquoted pathspec `READ*.md` would match tracked README.md.
+    const r = runHook(editPayload(path.join(repo, 'READ*.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: tracked file reached through a symlink is blocked', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    fs.mkdirSync(path.join(repo, 'ignored'));
+    fs.symlinkSync(path.join(repo, 'README.md'), path.join(repo, 'ignored', 'link.md'));
+    const r = runHook(editPayload(path.join(repo, 'ignored', 'link.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 2, `expected exit 2, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: case-variant name of a tracked file is blocked (case-insensitive FS only)', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    if (!fs.existsSync(path.join(repo, 'readme.md'))) {
+      console.log('      (skipped: filesystem is case-sensitive)');
+      return;
+    }
+    const r = runHook(editPayload(path.join(repo, 'readme.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 2, `expected exit 2, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: trackedness check error fails closed (blocked)', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    // A corrupt index makes ls-files fail while rev-parse (branch lookup)
+    // still works, so the hook reaches R1b and the check itself errors.
+    fs.writeFileSync(path.join(repo, '.git', 'index'), 'garbage');
+    const r = runHook(editPayload(path.join(repo, 'notes.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 2, `expected exit 2, got ${r.code}; stderr: ${r.stderr}`);
+    assert(r.stderr.includes('R1b BLOCKED'), 'expected R1b BLOCKED');
+    assert(r.stderr.includes('failing closed'), 'expected fail-closed reason');
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: tracked file is allowed when no other session is active', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    for (const f of fs.readdirSync(state)) fs.unlinkSync(path.join(state, f));
+    const r = runHook(editPayload(path.join(repo, 'README.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: tracked file in a worktree is allowed even with other sessions active', () => {
+  const { repo, state } = sharedCheckout();
+  try {
+    const wt = addWorktree(repo, 'feat/mine', 'mine');
+    const r = runHook(editPayload(path.join(wt, 'README.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
   } finally {
     cleanup(repo);
     cleanup(state);
