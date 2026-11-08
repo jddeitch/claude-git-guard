@@ -658,6 +658,9 @@ const R0_CASES = [
   ['cd "~/there"', 0], // quoted: no tilde expansion, literal ./~/there doesn't exist
   ['cd $SOMEWHERE && cd there', 0],
   ['cd - && cd there', 0],
+  ['cd -P {there}', 2],
+  ['cd -- {there}', 2],
+  ['pushd -L ~/there', 2],
 ];
 
 for (const [command, expected] of R0_CASES) {
@@ -939,6 +942,8 @@ const R4_SCOPE_CASES = [
   ['elsewhere', 'git stash pop', false],
   ['elsewhere', 'git -C {elsewhere} add -A', true],
   ['wt', 'git -C {wt} reset --hard', true],
+  ['wt', 'cd {wt} && git stash -u', true],
+  ['wt', '(cd {wt} && git clean -fd)', true],
 ];
 
 for (const [at, command, warns] of R4_SCOPE_CASES) {

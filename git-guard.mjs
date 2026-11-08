@@ -423,11 +423,12 @@ function handleEditWrite(sessionId, filePath) {
  * newline), in order. Each entry is { raw, target } where target is the
  * statically-resolvable path (`~` and `~/…` expanded; bare `cd` = home) or
  * null when it can't be known (`$VAR`, backticks, `cd -`, `~user`).
+ * Options (`cd -P`, `cd -L`, `cd --`) are skipped to reach the target.
  * `(cd x && …)` subshells are deliberately not matched: they don't move the
  * session's working directory.
  */
 function extractCdTargets(command) {
-  const re = /(?:^|&&|;|\|\||\n)[ \t]*(?:cd|pushd)(?:[ \t]+(?:"([^"]*)"|'([^']*)'|([^\s;&|()]+))|(?=[ \t]*(?:$|&&|;|\|\||\n)))/g;
+  const re = /(?:^|&&|;|\|\||\n)[ \t]*(?:cd|pushd)(?:[ \t]+-[LPe@]+)*(?:[ \t]+--)?(?:[ \t]+(?:"([^"]*)"|'([^']*)'|([^\s;&|()]+))|(?=[ \t]*(?:$|&&|;|\|\||\n)))/g;
   const out = [];
   let m;
   while ((m = re.exec(command)) !== null) {
@@ -836,19 +837,6 @@ const SWEEPS_UNTRACKED = 'sweeps up every file on this checkout, including other
 const SWEEPS_TRACKED = 'sweeps other sessions\' uncommitted changes to tracked files into your commit.';
 
 /**
- * R4 classifier: returns { label, note? } for a git invocation that can
- * damage or sweep up other sessions' work on a shared checkout, else null.
- *
- * Destructive verbs (any form): stash, checkout, switch, reset --hard.
- * Sweeping forms — the counterpart to R1b allowing untracked edits, since
- * these are what DO catch untracked (and others' tracked) files:
- *   add -A/--all/-u/--update, add <blanket pathspec> (except -n/--dry-run)
- *   commit -a/--all, commit <blanket pathspec>
- *   clean (except -n/--dry-run)
- *   stash push/save -u/--include-untracked/-a/--all (labelled specially;
- *   plain stash already warns)
- */
-/**
  * The checkouts a git invocation can reach, as a Set of canonical
  * toplevels, or null if that can't be determined.
  *   'checkout': the one working tree the command runs in (-C path or CWD).
@@ -876,8 +864,24 @@ function affectedToplevels(cPath, scope) {
   }
 }
 
+// Any cd/pushd token, at a boundary or inside a subshell.
+const CD_ANYWHERE = /(?:^|[\s;&|(])(?:cd|pushd)(?=\s|$|[;&|)])/;
+
 const R4_SUBCOMMANDS = new Set(['reset', 'checkout', 'switch', 'add', 'commit', 'clean', 'stash']);
 
+/**
+ * R4 classifier: returns { label, note? } for a git invocation that can
+ * damage or sweep up other sessions' work on a shared checkout, else null.
+ *
+ * Destructive verbs (any form): stash, checkout, switch, reset --hard.
+ * Sweeping forms — the counterpart to R1b allowing untracked edits, since
+ * these are what DO catch untracked (and others' tracked) files:
+ *   add -A/--all/-u/--update, add <blanket pathspec> (except -n/--dry-run)
+ *   commit -a/--all, commit <blanket pathspec>
+ *   clean (except -n/--dry-run)
+ *   stash push/save -u/--include-untracked/-a/--all (labelled specially;
+ *   plain stash already warns)
+ */
 function classifyR4(inv) {
   const { subcommand, rest } = inv;
   if (!R4_SUBCOMMANDS.has(subcommand)) return null;
@@ -1066,7 +1070,12 @@ function handleBash(command, sessionId) {
   for (const inv of invocations) {
     const hit = classifyR4(inv);
     if (!hit) continue;
-    const affected = affectedToplevels(inv.cPath, hit.scope || 'checkout');
+    // Without -C, git runs wherever the shell is — and any cd/pushd in the
+    // command (chained or in a subshell) can have moved it. Don't guess:
+    // count everyone, as R4 did before scoping.
+    const affected = (!inv.cPath && CD_ANYWHERE.test(command))
+      ? null
+      : affectedToplevels(inv.cPath, hit.scope || 'checkout');
     const prev = matched.find(m => m.label === hit.label);
     if (!prev) matched.push({ ...hit, affected });
     else if (prev.affected && affected) affected.forEach(t => prev.affected.add(t));
