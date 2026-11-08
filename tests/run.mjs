@@ -531,6 +531,110 @@ test('R5: matching-ref pull is allowed', () => {
   }
 });
 
+// --- R4 (warning when other sessions are active) ---
+
+const R4_WARN_CASES = [
+  // [args after `git`, label expected in the warning]
+  ['add -A', 'git add -A'],
+  ['add --all', 'git add -A'],
+  ['add -vA', 'git add -A'],
+  ['add .', 'git add .'],
+  ['add -- .', 'git add .'],
+  ['add :/', 'git add :/'],
+  ['add -u', 'git add -u'],
+  ['add --update', 'git add -u'],
+  ['commit -a -m "msg"', 'git commit -a'],
+  ['commit --all -m msg', 'git commit -a'],
+  ['commit -am "msg"', 'git commit -a'],
+  ['commit -m msg .', 'git commit .'],
+  ['clean -fd', 'git clean'],
+  ['clean -f -x', 'git clean'],
+  ['stash -u', 'git stash -u'],
+  ['stash push --include-untracked', 'git stash -u'],
+  ['stash --all', 'git stash -u'],
+  ['stash save -u "wip"', 'git stash -u'],
+  ['stash', 'git stash'],
+  ['reset --hard', 'git reset --hard'],
+  ['reset -q --hard HEAD', 'git reset --hard'],
+  ['checkout other', 'git checkout'],
+];
+
+const R4_SILENT_CASES = [
+  'add README.md',
+  'add -n .',
+  'add --dry-run -A',
+  'commit -m "drop the -a flag from add ."',
+  'commit -ma',
+  'commit -m msg README.md',
+  'clean -n',
+  'clean -nfd',
+  'clean --dry-run',
+  'reset HEAD~1',
+  'status',
+];
+
+function r4Run(command, withOthers = true) {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'feat/x');
+    if (withOthers) fakeOtherSession(state, repo);
+    const cmd = command.replaceAll('{repo}', repo);
+    return runHook(
+      { tool_name: 'Bash', tool_input: { command: cmd }, session_id: 'me' },
+      { GIT_GUARD_STATE_DIR: state },
+      repo
+    );
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+}
+
+for (const [args, label] of R4_WARN_CASES) {
+  for (const prefix of ['git', 'git -C {repo}']) {
+    test(`R4: "${prefix} ${args}" warns as "${label}"`, () => {
+      const r = r4Run(`${prefix} ${args}`);
+      assert(r.code === 0, `expected exit 0 (warn, not block), got ${r.code}; stderr: ${r.stderr}`);
+      const text = warningText(r);
+      assert(text.includes('OTHER SESSIONS ACTIVE'), `expected R4 warning, got stdout: ${r.stdout}`);
+      assert(text.includes(`"${label}"`), `expected label "${label}" in: ${text}`);
+    });
+  }
+}
+
+for (const args of R4_SILENT_CASES) {
+  for (const prefix of ['git', 'git -C {repo}']) {
+    test(`R4: "${prefix} ${args}" does not warn`, () => {
+      const r = r4Run(`${prefix} ${args}`);
+      assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+      assert(!warningText(r).includes('OTHER SESSIONS ACTIVE'), `unexpected R4 warning: ${r.stdout}`);
+    });
+  }
+}
+
+test('R4: --work-tree= form warns', () => {
+  const r = r4Run('git --work-tree={repo} add -A');
+  assert(warningText(r).includes('"git add -A"'), `expected R4 warning, got: ${r.stdout}`);
+});
+
+test('R4: sweeping commands explain what they sweep', () => {
+  const r = r4Run('git add -A');
+  assert(warningText(r).includes('untracked'), `expected untracked note, got: ${warningText(r)}`);
+});
+
+test('R4: chained add -A && commit -a names both commands', () => {
+  const r = r4Run('git add -A && git commit -a -m wip');
+  const text = warningText(r);
+  assert(text.includes('"git add -A"') && text.includes('"git commit -a"'), `expected both labels, got: ${text}`);
+});
+
+test('R4: no warning when no other session is active', () => {
+  const r = r4Run('git add -A', false);
+  assert(r.code === 0, `expected exit 0, got ${r.code}`);
+  assert(r.stdout === '', `expected no output, got: ${r.stdout}`);
+});
+
 // --- fail-open paths ---
 
 test('fail-open: malformed JSON on stdin', () => {

@@ -632,6 +632,154 @@ function resolveBranchForInvocation(cPath) {
   }).trim();
 }
 
+/**
+ * Split an invocation's `rest` into shell tokens, respecting quotes, so a
+ * commit message like `-m "drop -a flag"` is one token, not a flag.
+ */
+function tokenizeArgs(rest) {
+  const tokens = [];
+  let pos = 0;
+  while (pos < rest.length) {
+    while (pos < rest.length && /\s/.test(rest[pos])) pos++;
+    if (pos >= rest.length) break;
+    const [tok, next] = readShellToken(rest, pos);
+    if (tok === null) break;
+    if (next <= pos) { pos++; continue; }
+    tokens.push(tok);
+    pos = next;
+  }
+  return tokens;
+}
+
+// Pathspecs that mean "everything" (from the repo root or the cwd).
+const BLANKET_PATHSPECS = new Set(['.', './', ':/', ':', '*', ':/*', ':(top)']);
+
+/**
+ * Does a short-option cluster (`-am`, `-ku`) set one of `flags` before
+ * reaching an option that consumes the rest of the cluster as its argument?
+ * `-am msg` sets -a; `-ma` is -m with the message "a".
+ */
+function clusterSets(token, flags, argTaking) {
+  if (!/^-[a-zA-Z]+$/.test(token)) return false;
+  for (const ch of token.slice(1)) {
+    if (flags.includes(ch)) return true;
+    if (argTaking.includes(ch)) return false;
+  }
+  return false;
+}
+
+/**
+ * Walk tokens, separating options from positionals. Options listed in
+ * `argOpts` (short `-m`, long `--message`) consume the next token unless
+ * written `--opt=value` / attached. Everything after `--` is positional.
+ */
+function splitArgs(tokens, argOpts) {
+  const options = [];
+  const positionals = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === '--') {
+      positionals.push(...tokens.slice(i + 1));
+      break;
+    }
+    if (t.startsWith('-') && t.length > 1) {
+      options.push(t);
+      if (argOpts.includes(t)) i++;
+      else if (/^-[a-zA-Z]+$/.test(t)) {
+        // Short cluster ending in an arg-taking option with nothing attached
+        // (`-am "msg"`) consumes the next token.
+        const last = t[t.length - 1];
+        if (argOpts.includes(`-${last}`)) i++;
+      }
+      continue;
+    }
+    positionals.push(t);
+  }
+  return { options, positionals };
+}
+
+const COMMIT_ARG_OPTS = [
+  '-m', '-F', '-C', '-c', '-t',
+  '--message', '--file', '--author', '--date', '--reuse-message', '--reedit-message',
+  '--fixup', '--squash', '--template', '--cleanup', '--trailer', '--pathspec-from-file',
+];
+const STASH_ARG_OPTS = ['-m', '--message', '--pathspec-from-file'];
+const STASH_NON_PUSH = new Set(['list', 'show', 'drop', 'pop', 'apply', 'branch', 'clear', 'create', 'store']);
+
+const SWEEPS_UNTRACKED = 'sweeps up every file on this checkout, including other sessions\' new untracked files.';
+const SWEEPS_TRACKED = 'sweeps other sessions\' uncommitted changes to tracked files into your commit.';
+
+/**
+ * R4 classifier: returns { label, note? } for a git invocation that can
+ * damage or sweep up other sessions' work on a shared checkout, else null.
+ *
+ * Destructive verbs (any form): stash, checkout, switch, reset --hard.
+ * Sweeping forms — the counterpart to R1b allowing untracked edits, since
+ * these are what DO catch untracked (and others' tracked) files:
+ *   add -A/--all/-u/--update, add <blanket pathspec> (except -n/--dry-run)
+ *   commit -a/--all, commit <blanket pathspec>
+ *   clean (except -n/--dry-run)
+ *   stash push/save -u/--include-untracked/-a/--all (labelled specially;
+ *   plain stash already warns)
+ */
+function classifyR4(inv) {
+  const { subcommand, rest } = inv;
+  const tokens = tokenizeArgs(rest);
+
+  if (subcommand === 'reset') {
+    return tokens.includes('--hard') ? { label: 'git reset --hard' } : null;
+  }
+  if (subcommand === 'checkout') return { label: 'git checkout' };
+  if (subcommand === 'switch') return { label: 'git switch' };
+
+  if (subcommand === 'add') {
+    const { options, positionals } = splitArgs(tokens, ['--chmod', '--pathspec-from-file']);
+    // add's short options take no arguments, so any cluster char counts.
+    if (options.some(o => o === '-n' || o === '--dry-run' || clusterSets(o, ['n'], []))) return null;
+    if (options.some(o => o === '-A' || o === '--all' || clusterSets(o, ['A'], []))) {
+      return { label: 'git add -A', note: SWEEPS_UNTRACKED };
+    }
+    const blanket = positionals.find(p => BLANKET_PATHSPECS.has(p));
+    if (blanket) return { label: `git add ${blanket}`, note: SWEEPS_UNTRACKED };
+    if (options.some(o => o === '-u' || o === '--update' || clusterSets(o, ['u'], []))) {
+      return { label: 'git add -u', note: SWEEPS_TRACKED };
+    }
+    return null;
+  }
+
+  if (subcommand === 'commit') {
+    const { options, positionals } = splitArgs(tokens, COMMIT_ARG_OPTS);
+    if (options.some(o => o === '-a' || o === '--all' || clusterSets(o, ['a'], ['m', 'F', 'C', 'c', 't']))) {
+      return { label: 'git commit -a', note: SWEEPS_TRACKED };
+    }
+    const blanket = positionals.find(p => BLANKET_PATHSPECS.has(p));
+    if (blanket) return { label: `git commit ${blanket}`, note: SWEEPS_TRACKED };
+    return null;
+  }
+
+  if (subcommand === 'clean') {
+    const dryRun = tokens.some(t => t === '-n' || t === '--dry-run' || clusterSets(t, ['n'], ['e']));
+    return dryRun ? null : {
+      label: 'git clean',
+      note: 'deletes untracked files — including other sessions\' new files on this checkout.',
+    };
+  }
+
+  if (subcommand === 'stash') {
+    if (tokens.length > 0 && STASH_NON_PUSH.has(tokens[0])) return { label: 'git stash' };
+    const { options } = splitArgs(tokens, STASH_ARG_OPTS);
+    const untracked = options.some(o =>
+      o === '-u' || o === '--include-untracked' || o === '-a' || o === '--all' ||
+      clusterSets(o, ['u', 'a'], ['m'])
+    );
+    return untracked
+      ? { label: 'git stash -u', note: 'stashes untracked files too — including other sessions\' new files.' }
+      : { label: 'git stash' };
+  }
+
+  return null;
+}
+
 function handleBash(command, sessionId) {
   if (!command) {
     process.exit(0);
@@ -745,35 +893,33 @@ function handleBash(command, sessionId) {
     }
   }
 
-  // R4: Warn on destructive verbs when other sessions are active. Matches
-  // on subcommand + rest rather than a regex against the raw command, so
-  // `git -C <path> stash` (etc.) no longer bypasses the check.
-  const destructiveLabels = { stash: 'git stash', checkout: 'git checkout', switch: 'git switch' };
-  let matchedDestructive = null;
+  // R4: Warn on destructive or sweeping verbs when other sessions are
+  // active. Matches on subcommand + rest rather than a regex against the
+  // raw command, so `git -C <path> stash` (etc.) doesn't bypass the check.
+  // Collects every match so a chained `git add -A && git commit` names both.
+  const matched = [];
   for (const inv of invocations) {
-    if (inv.subcommand === 'reset' && /^--hard\b/.test(inv.rest)) {
-      matchedDestructive = { label: 'git reset --hard' };
-      break;
-    }
-    // Object.hasOwn rather than `in` — subcommand is user-controlled text,
-    // `__proto__` and `constructor` would otherwise match the label table.
-    if (Object.hasOwn(destructiveLabels, inv.subcommand)) {
-      matchedDestructive = { label: destructiveLabels[inv.subcommand] };
-      break;
-    }
+    const hit = classifyR4(inv);
+    if (hit && !matched.some(m => m.label === hit.label)) matched.push(hit);
   }
-  if (matchedDestructive) {
+  if (matched.length > 0) {
     ensureStateDir();
     const others = getOtherSessions(sessionId);
     if (others.length > 0) {
       const sessionList = others
         .map(s => `  - session ${s.session_id.slice(0, 8)}... on branch "${s.branch}"`)
         .join('\n');
+      const labels = matched.map(m => `"${m.label}"`).join(', ');
+      const notes = matched
+        .filter(m => m.note)
+        .map(m => `${m.label}: ${m.note}\n`)
+        .join('');
       warnings.push(
         `[GIT GUARD WARNING — OTHER SESSIONS ACTIVE]\n` +
         'DO NOT STEAMROLL GIT-GUARD!\n' +
-        `You are about to run "${matchedDestructive.label}" but there are ${others.length} other active session(s):\n` +
+        `You are about to run ${labels} but there are ${others.length} other active session(s):\n` +
         `${sessionList}\n` +
+        notes +
         `This command will affect their working tree. Proceed with caution.`
       );
     }
