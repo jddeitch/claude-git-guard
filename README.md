@@ -10,19 +10,21 @@ Derived from a hook that's been in production for three months inside a personal
 
 | Rule | Path | Behaviour | What it prevents |
 |---|---|---|---|
-| **R0** | Bash | Block | `cd <different-repo>` — prevents subsequent git commands operating on the wrong repo |
+| **R0** | Bash | Block | `cd`/`pushd` into a different repo — prevents subsequent git commands operating on the wrong repo. Every `cd` in the command is checked, `~` included. Moving between the repo's own worktrees is allowed. |
 | **R1** | Edit/Write | Block | Edits on a protected branch (default: `main`, `master`) |
-| **R1b** | Edit/Write | Block | Edits when other sessions are on the same checkout — forces worktrees |
+| **R1b** | Edit/Write | Block | Edits to **tracked** files on a shared (non-worktree) checkout while another session has uncommitted changes there — forces worktrees. Clears once that session commits. New untracked and gitignored files are allowed. |
 | **R2** | Edit/Write | Block | Edits after another session switched branches underneath you |
 | **R3** | Bash | Warn | `git push` targeting a protected branch |
-| **R4** | Bash | Warn | Destructive verbs (`stash`, `checkout`, `switch`, `reset --hard`) when other sessions are active |
+| **R4** | Bash | Warn | When other sessions work where the command reaches: destructive verbs (`stash`, `checkout`, `switch`, `reset --hard`) and commands that sweep up their files (`add -A`/`-u`/`.`, `commit -a`/`.`, `clean`, `stash -u`) |
 | **R5** | Bash | Block | `git pull <remote> <wrong-ref>` — the silent pointer-move that can cost commits of drift |
 
 Blocks emit `[git-guard R<n> BLOCKED]` on stderr with a recovery message. Warnings emit JSON with `permissionDecision: "allow"` so the warning text reaches Claude without blocking the tool call.
 
+**The Edit/Write rules (R1, R1b, R2) see only Claude Code's Edit and Write tools.** A file written from the shell (`cp`, `mv`, `cat > file`, `sed -i`, `tee`, a script) is invisible to them. The Bash rules inspect git commands, not shell writes.
+
 ## Install
 
-1. Copy `git-guard.mjs` into your project. Suggested location: `.claude/hooks/git-guard.mjs`.
+1. Copy `git-guard.mjs` into your project (suggested location: `.claude/hooks/git-guard.mjs`), or clone this repo once and point each project's hook at the clone by absolute path (`node /path/to/claude-git-guard/git-guard.mjs`) so every project runs the same copy.
 
 2. Register it in `.claude/settings.json` (project-wide) or `.claude/settings.local.json` (machine-specific, typically gitignored):
 
@@ -66,7 +68,19 @@ To disable the hook, remove its entry from `settings.json` — there is delibera
 
 **Session state.** On first Edit/Write, the hook records the session's branch for that worktree in the state dir. On subsequent edits, it compares — if they differ (another session switched branches underneath), it blocks with R2. `git branch -m` renames are detected and tolerated.
 
-**Fail-open by default.** Parse errors, missing git context, unreadable state files — the hook exits 0 and allows the tool call. The exception is R5: on branch-lookup failure while a pull command is detected, it fails CLOSED, because a silent pointer-move is precisely what R5 exists to prevent.
+**Shared checkouts (R1b).** Each session's state file lists the files it has edited on that checkout, with the time of its last edit to each. When another session is on the same non-worktree checkout, the hook asks git whether the file being edited is in the index (`git ls-files`, committed or staged). Untracked and gitignored files are always allowed: another session's stash, reset, checkout or commit leaves them alone. The commands that *do* catch untracked files are covered by R4 instead. The path is canonicalized first, so a symlink to a tracked file, or a case-variant name on macOS, still counts as tracked.
+
+A tracked edit is blocked only while another session *holds* the checkout. The hook lists the tracked files with uncommitted changes (`git status`, staged or not) and attributes each to the session that edited it most recently. A session holds the checkout while at least one change is attributed to it. Once it commits, it stops blocking anyone. A session that has only written drafts holds nothing until it stages one. R4 still counts it, so the main session is warned before an `add -A`, `clean` or `stash -u` that would sweep the draft up.
+
+Sessions registered by an older git-guard have no file list, so no change can be attributed to them. Such a session holds the checkout while some *other* file than the one being edited has an uncommitted change that no session claims, since that change might be its work. A change only in the target file is excluded, because it is as likely the editing session's own earlier work.
+
+**Who R4 warns about.** Only sessions the command can reach: those on the same checkout for `add`, `commit`, `clean`, `stash push`, `checkout`, `switch` and `reset`, which only touch the working tree they run in; and those on any worktree of the same repo for `stash pop`/`drop`/`clear`/`store`/`branch`, because the stash list is shared. Sessions on other repos are not listed. If the target can't be resolved, R4 counts everyone. Read-only `stash list`/`show` don't warn.
+
+**Session expiry.** A session's state file is rewritten on every allowed edit, so it expires 24 hours after its *last* edit.
+
+**Same repo, by common git dir (R0).** Every worktree has its own toplevel but shares the repo's common git dir, so R0 compares common dirs. `cd` between the main checkout and its worktrees is allowed; `cd` into a different repo is blocked.
+
+**Fail-open by default.** Parse errors, missing git context, unreadable state files — the hook exits 0 and allows the tool call. Two exceptions fail CLOSED: R5, on branch-lookup failure while a pull command is detected, because a silent pointer-move is precisely what R5 exists to prevent; and R1b, when another session is active and git can't say whether the file is tracked or which files have uncommitted changes, because it can't prove the edit is safe.
 
 **Warnings via JSON output.** R3 and R4 do not block; they emit a stdout JSON payload that Claude Code surfaces to the agent as decision context. Older Claude Code versions that only honor plain stdout will not see these warnings — the hard blocks (R0, R1, R1b, R2, R5) use stderr + exit 2 and work on all versions.
 
@@ -81,7 +95,10 @@ To disable the hook, remove its entry from `settings.json` — there is delibera
 
 - **Developed and tested on macOS and Linux.** POSIX paths assumed. Windows contributors welcome.
 - **`GIT_GUARD_PROTECTED_BRANCHES` is a literal list**, not a glob. If you use `release/*` style branches, list them explicitly.
-- **`git -C <path> pull …`** is out of R5's scope. Pulls with `-C` fall through because R5 checks the hook's CWD branch, not the `-C` target's.
+- **Shell writes bypass R1/R1b/R2.** See above: only the Edit and Write tools are inspected.
+- **R4 is a warning, and string-level.** It parses `git` invocations (including `-C <path>`, `--work-tree=`, `--git-dir=`), not aliases, shell functions or dynamically built commands.
+- **Sessions are known only through their Edit/Write calls.** A session that has only run Bash commands isn't registered, and a session that ended keeps counting for R4 until its state expires (24 hours after its last edit). For R1b, an ended session's uncommitted changes keep holding the checkout until they are committed or the state expires.
+- **Changes made from the shell belong to no session.** R1b attributes an uncommitted change only to a session that edited that file with Edit or Write. A file changed by `sed -i`, a formatter or a script, and not otherwise edited, holds nothing (except against sessions from older versions, as described above).
 - **R1b is bypass-able via worktrees**, which is the point — the worktree IS the fix, not a workaround.
 
 ## Testing
@@ -91,6 +108,22 @@ npm test
 ```
 
 The harness spawns the hook as a subprocess with controlled stdin, asserts exit codes and stdout/stderr contents. Add a case for any new rule or edge case.
+
+## Changelog
+
+**0.2.0**
+- R1b blocks only edits to files git tracks (committed or staged). New untracked and gitignored files are allowed on a shared checkout. Fails closed if the check errors.
+- R1b blocks only while another session has uncommitted changes in files it edited. Previously, any session that had ever edited a tracked file held the checkout for 24 hours, even after committing everything. State files now record each session's edited files (`edited_files`). Sessions registered by older versions are handled conservatively: see "How it works".
+- Bash parsing: shell-boundary characters inside quotes (`-m "feat(x): y"`) no longer end a git invocation early.
+- R4 also warns on commands that sweep up other sessions' files: `git add -A`/`--all`/`-u`/`.`, `git commit -a`/`.`, `git clean` (not dry runs), `git stash -u`/`--include-untracked`/`--all`. All matches in a chained command are named. `git reset -q --hard` (flag not first) is now caught.
+- R0 decides "different repo" by the common git dir, so `cd` into the repo's own worktrees is no longer blocked. Paths are canonicalized with native realpath, so case-variant spellings on macOS read as the same repo.
+- R4 warns only about sessions the command can reach (same checkout, or same repo for the shared stash list), not every session on the machine. `stash list`/`show`/`create` no longer warn.
+- R1/R1b/R2: a Write into a directory that doesn't exist yet no longer fails the hook open (it skipped R1 on `main`).
+- R0 checks every `cd`/`pushd` in a command, in order, including `~`, `~/…` and newline-separated commands; previously only the first `cd`, and never `~`.
+- Session state is refreshed on every edit, so a session running more than a day no longer drops out.
+- Docs: the Edit/Write rules do not see shell writes; corrected the stale claim that `git -C <path> pull` is out of R5's scope.
+
+**0.1.0** — initial release.
 
 ## Maintenance
 
