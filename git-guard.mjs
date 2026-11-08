@@ -7,8 +7,9 @@
 // Edit|Write path — Hard gates:
 //   R1   Block edits on a protected branch
 //   R1b  Block edits to TRACKED files on a shared (non-worktree) checkout
-//        while other sessions are active on it. Untracked and gitignored
-//        files are allowed. Fails closed if trackedness can't be checked.
+//        while another session holds it: has uncommitted changes (staged or
+//        not) in a file it edited. Untracked and gitignored files are
+//        allowed. Fails closed if git can't answer.
 //   R2   Block if branch drifted since session start
 //
 // Bash path — mixed:
@@ -182,24 +183,47 @@ function readSessionState(key) {
   }
 }
 
-// `untrackedOnly`: true while every Edit/Write this session has made on this
-// checkout was PROVEN to target an untracked/ignored file. R1b ignores such
-// sessions (a draft-writer must not lock the main session out of tracked
-// files); R4 still counts them (their drafts are what add -A/clean sweep).
-// State files without the field (older versions) read as false.
-function writeSessionState(key, branch, sessionId, toplevel, untrackedOnly) {
+// `editedFiles`: { "<repo-relative path>": <ms timestamp of last edit> } for
+// every file this session has passed through Edit/Write on this checkout,
+// tracked or not. R1b uses it to attribute uncommitted changes: a session
+// holds a shared checkout only while a file it edited has uncommitted
+// changes (see sessionsHoldingCheckout). `null` means the session's edits
+// are not fully known — written by an older git-guard, or a path could not
+// be resolved — and is written as an absent field.
+const MAX_EDITED_FILES = 5000;
+
+function writeSessionState(key, branch, sessionId, toplevel, editedFiles) {
   try {
     const fp = path.join(STATE_DIR, `${key}.json`);
-    fs.writeFileSync(fp, JSON.stringify({
-      branch,
-      session_id: sessionId,
-      toplevel,
-      untracked_only: untrackedOnly === true,
-      recorded_at: Date.now(),
-    }));
+    const data = { branch, session_id: sessionId, toplevel, recorded_at: Date.now() };
+    if (editedFiles) data.edited_files = editedFiles;
+    // Write-then-rename: other sessions read this file on every edit, and a
+    // half-written file would parse as corrupt and drop this session.
+    const tmp = `${fp}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, fp);
   } catch {
     // Non-fatal
   }
+}
+
+/**
+ * A session state's file claims, or null if unknown. State written by
+ * earlier versions has no `edited_files`; 0.2.0 pre-releases wrote
+ * `untracked_only: true` for sessions that had touched no tracked file,
+ * which is an empty claim set as far as tracked changes go.
+ */
+function claimsOf(state) {
+  const files = state?.edited_files;
+  if (files && typeof files === 'object' && !Array.isArray(files)) return files;
+  if (state?.untracked_only === true) return {};
+  return null;
+}
+
+function claimTime(claims, rel) {
+  if (!claims || !Object.hasOwn(claims, rel)) return null;
+  const t = claims[rel];
+  return typeof t === 'number' ? t : null;
 }
 
 function getOtherSessions(currentSessionId) {
@@ -247,28 +271,21 @@ function firstLine(err) {
 }
 
 /**
- * Is `filePath` known to git's index in the checkout at `toplevel`?
- * Returns true/false; THROWS if it can't tell (R1b treats that as tracked).
+ * Locate `filePath` inside the checkout at `toplevel`.
+ * Returns { top, canonical, rel }: the canonical toplevel, the canonical
+ * path git should be asked about, and that path relative to the toplevel
+ * with `/` separators (null if it lies outside — git then errors on it).
  *
- * "Tracked" means present in the index — committed files and staged new
- * files alike, since both are what stash/reset/checkout act on. Untracked
- * and gitignored files are not in the index and return false (a
- * force-added ignored file IS in the index and returns true).
- *
- * The path is canonicalized first (symlinks and on-disk case). Without
- * that, on macOS an Edit of `readme.md` would modify the tracked
- * `README.md` while `ls-files readme.md` reports it untracked. A path that
- * doesn't exist yet (possibly in directories that don't exist yet) keeps
- * its name and canonicalizes its nearest existing ancestor.
- *
- * `--literal-pathspecs` stops `*`, `?`, `[` in a file name being read as a
- * glob that matches other, tracked files. The pathspec is absolute, so git
- * itself errors (→ fail closed) if it still resolves outside this checkout.
+ * The path is canonicalized (symlinks and on-disk case). Without that, on
+ * macOS an Edit of `readme.md` would modify the tracked `README.md` while
+ * `ls-files readme.md` reports it untracked. A path that doesn't exist yet
+ * (possibly in directories that don't exist yet) keeps its name and
+ * canonicalizes its nearest existing ancestor.
  */
-function isTrackedPath(toplevel, filePath) {
-  if (!filePath) throw new Error('no file path in tool input');
-  const abs = path.resolve(filePath);
+function locateInCheckout(toplevel, filePath) {
   const top = canonicalPath(toplevel);
+  if (!filePath) return { top, canonical: null, rel: null };
+  const abs = path.resolve(filePath);
   // The path itself, with only its directory canonicalized (keeps a
   // symlink's own name; used when the file doesn't exist yet).
   const lexical = path.join(canonicalizeMaybeMissing(path.dirname(abs)), path.basename(abs));
@@ -281,15 +298,103 @@ function isTrackedPath(toplevel, filePath) {
   // A symlink in this checkout pointing OUTSIDE it: the target is in no
   // index of ours, so ask about the link itself (tracked link → blocked)
   // rather than hand git an out-of-repo path it would refuse.
-  if (canonical !== top && !canonical.startsWith(top + path.sep)) {
-    canonical = lexical;
-  }
+  if (!canonical.startsWith(top + path.sep)) canonical = lexical;
+  const rel = canonical.startsWith(top + path.sep)
+    ? path.relative(top, canonical).split(path.sep).join('/')
+    : null;
+  return { top, canonical, rel };
+}
+
+/**
+ * Is the located path known to git's index? Returns true/false; THROWS if
+ * it can't tell (R1b treats that as tracked).
+ *
+ * "Tracked" means present in the index — committed files and staged new
+ * files alike, since both are what stash/reset/checkout act on. Untracked
+ * and gitignored files are not in the index and return false (a
+ * force-added ignored file IS in the index and returns true).
+ *
+ * `--literal-pathspecs` stops `*`, `?`, `[` in a file name being read as a
+ * glob that matches other, tracked files. The pathspec is absolute, so git
+ * itself errors (→ fail closed) if it still resolves outside this checkout.
+ */
+function isTrackedPath({ top, canonical }) {
+  if (!canonical) throw new Error('no file path in tool input');
   const out = execFileSync(
     'git',
-    ['-C', top, '--literal-pathspecs', 'ls-files', '-z', '--', canonical],
+    ['--no-optional-locks', '-C', top, '--literal-pathspecs', 'ls-files', '-z', '--', canonical],
     { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }
   );
   return out.length > 0;
+}
+
+/**
+ * Tracked files with uncommitted changes (staged or not), repo-relative.
+ * `--no-optional-locks` keeps status from taking index.lock, which would
+ * make another session's concurrent `git add`/`commit` fail.
+ */
+function dirtyTrackedFiles(top) {
+  const out = execFileSync(
+    'git',
+    ['--no-optional-locks', '-C', top, 'status', '--porcelain=v1', '-z',
+      '--untracked-files=no', '--no-renames'],
+    { encoding: 'utf-8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }
+  );
+  return out.split('\0').filter(Boolean).map(entry => entry.slice(3));
+}
+
+/**
+ * Which of `others` hold this checkout right now, and through which files.
+ *
+ * Each uncommitted tracked change is attributed to the session that edited
+ * that file most recently (this session included; a tie goes to the other
+ * session). A session holds the checkout while at least one change is
+ * attributed to it — so once it commits, it stops blocking anyone.
+ *
+ * Sessions whose edits are unknown (state from an older git-guard) can't be
+ * attributed anything. They hold the checkout while some change no known
+ * session claims exists in a file OTHER than the one being edited: that
+ * change might be theirs. The target itself is excluded because its
+ * unclaimed change is as likely the editing session's own earlier work, and
+ * blocking on it would wedge the checkout until the unknown session expires.
+ *
+ * `dirty` is dirtyTrackedFiles() for the checkout.
+ */
+function sessionsHoldingCheckout({ rel }, dirty, ownClaims, others) {
+  const holders = new Map();
+  const hold = (s, f) => {
+    if (!holders.has(s)) holders.set(s, []);
+    holders.get(s).push(f);
+  };
+  const unknown = others.filter(s => claimsOf(s) === null);
+  for (const f of dirty) {
+    let owner = null;
+    let latest = claimTime(ownClaims, f) ?? -Infinity;
+    for (const s of others) {
+      const t = claimTime(claimsOf(s), f);
+      if (t !== null && t >= latest) {
+        owner = s;
+        latest = t;
+      }
+    }
+    if (owner) {
+      hold(owner, f);
+    } else if (latest === -Infinity && f !== rel) {
+      for (const s of unknown) hold(s, f);
+    }
+  }
+  return holders;
+}
+
+function describeHolders(holders) {
+  return [...holders].map(([s, files]) => {
+    const shown = files.slice(0, 5).join(', ') + (files.length > 5 ? `, … (${files.length} files)` : '');
+    const who = `  - session ${String(s.session_id).slice(0, 8)}... on branch "${s.branch}"`;
+    return claimsOf(s) === null
+      ? `${who} (registered by an older git-guard, so its edits are unknown): ` +
+        `unclaimed uncommitted changes in ${shown}`
+      : `${who}: uncommitted changes in ${shown}`;
+  }).join('\n');
 }
 
 function handleEditWrite(sessionId, filePath) {
@@ -312,6 +417,8 @@ function handleEditWrite(sessionId, filePath) {
   ensureStateDir();
   cleanStaleFiles();
 
+  const state = readSessionState(key);
+
   // R1b: Block shared-checkout edits. Solo sessions on the main tree are fine.
   const isWorktree = (() => {
     try {
@@ -323,66 +430,98 @@ function handleEditWrite(sessionId, filePath) {
     }
   })();
 
-  // Only TRACKED files are blocked: those are what another session's stash,
-  // reset, checkout or commit will clobber or sweep up. A new untracked or
-  // gitignored file (a draft, a scratch note) isn't touched by any of those,
-  // so blocking it only forces a worktree for no safety gain. The commands
-  // that DO sweep untracked files (add -A, clean, stash -u) are R4's job.
-  //
-  // Trackedness is checked on every shared-checkout edit, even with no one
-  // else around, so the session's state records whether it has only ever
-  // touched untracked files. Only sessions that have edited tracked files
-  // count as "others" here — otherwise a session that wrote one draft would
-  // lock the session doing the real work out of its own tracked files.
-  let provenUntracked = false;
-  if (!isWorktree) {
-    // Fail CLOSED: if trackedness can't be established, treat as tracked.
-    let tracked = true;
-    let checkError = null;
-    try {
-      tracked = isTrackedPath(toplevel, filePath);
-    } catch (e) {
-      checkError = e;
-    }
-    provenUntracked = !tracked;
+  // This session's claims after this edit. Fresh sessions start with none.
+  let editedFiles = state ? claimsOf(state) : {};
 
-    const othersOnSameToplevel = getOtherSessions(sessionId)
-      .filter(s => s.toplevel === toplevel && s.untracked_only !== true);
-    if (othersOnSameToplevel.length > 0) {
+  if (!isWorktree) {
+    const target = locateInCheckout(toplevel, filePath);
+    // Listed at most once per edit, and only when needed. Throws if git can't.
+    let dirtyList = null;
+    const dirty = () => (dirtyList ??= dirtyTrackedFiles(target.top));
+    const others = getOtherSessions(sessionId).filter(s => s.toplevel === toplevel);
+
+    // A session whose earlier edits are unknown (registered by an older
+    // git-guard, or over MAX_EDITED_FILES) starts a fresh list once no
+    // uncommitted change it could own is left: every change in a file other
+    // than this one is claimed by a known session.
+    if (editedFiles === null && target.rel !== null) {
+      try {
+        const unclaimed = dirty().filter(f => f !== target.rel
+          && !others.some(s => claimTime(claimsOf(s), f) !== null));
+        if (unclaimed.length === 0) editedFiles = {};
+      } catch {
+        // Stay unknown.
+      }
+    }
+    if (editedFiles) {
+      editedFiles = target.rel === null
+        ? null
+        : { ...editedFiles, [target.rel]: Date.now() };
+      if (editedFiles && Object.keys(editedFiles).length > MAX_EDITED_FILES) editedFiles = null;
+    }
+
+    // A shared checkout is held only by sessions with uncommitted changes to
+    // TRACKED files: those are what another session's stash, reset, checkout
+    // or commit will clobber or sweep up. So:
+    //  - an edit to an untracked or gitignored file (a draft, a scratch note)
+    //    is always allowed — the commands that DO sweep untracked files
+    //    (add -A, clean, stash -u) are R4's job;
+    //  - a tracked edit is blocked only while another session holds the
+    //    checkout. A session that has committed its work no longer does.
+    // Sessions with no claims can't hold anything, so skip the git calls.
+    const candidates = others.filter(s => {
+      const c = claimsOf(s);
+      return c === null || Object.keys(c).length > 0;
+    });
+    if (candidates.length > 0) {
+      // Fail CLOSED: if trackedness can't be established, treat as tracked;
+      // if changes can't be listed, every candidate holds the checkout.
+      let tracked = true;
+      let checkError = null;
+      try {
+        tracked = isTrackedPath(target);
+      } catch (e) {
+        checkError = e;
+      }
       if (tracked) {
-        const sessionList = othersOnSameToplevel
-          .map(s => `  - session ${s.session_id.slice(0, 8)}... on branch "${s.branch}"`)
-          .join('\n');
-        const reason = checkError
-          ? `Could not determine whether ${filePath ?? '(no file path)'} is tracked by git — failing closed.\n` +
-            `  ${firstLine(checkError)}\n`
-          : `${filePath} is tracked by git.\n`;
-        process.stderr.write(
-          `[git-guard R1b BLOCKED] ${reason}` +
-          `${othersOnSameToplevel.length} other session(s) active on this checkout:\n` +
-          `${sessionList}\n\n` +
-          'DO NOT STEAMROLL GIT-GUARD!\n' +
-          'Edits to tracked files on a shared checkout collide: another session\'s stash, reset,\n' +
-          'checkout or commit will sweep up or clobber your change (and yours will theirs).\n' +
-          'New untracked or gitignored files are allowed here; tracked files need a worktree.\n' +
-          'Use your agent\'s worktree tool, or `git worktree add -b feat/<name> .worktrees/<name>`.\n' +
-          'Do NOT just create a branch in place — that moves every session listed above onto your branch.\n' +
-          'Do NOT delete state files or work around this.\n'
-        );
-        process.exit(2);
+        let holders;
+        let listError = null;
+        try {
+          holders = sessionsHoldingCheckout(target, dirty(), state ? claimsOf(state) : {}, candidates);
+        } catch (e) {
+          listError = e;
+          holders = new Map(candidates.map(s => [s, ['(could not list uncommitted changes)']]));
+        }
+        if (holders.size > 0) {
+          const reason = checkError
+            ? `Could not determine whether ${filePath ?? '(no file path)'} is tracked by git — failing closed.\n` +
+              `  ${firstLine(checkError)}\n`
+            : `${filePath} is tracked by git.\n`;
+          const listNote = listError
+            ? `Could not list uncommitted changes — failing closed.\n  ${firstLine(listError)}\n`
+            : '';
+          process.stderr.write(
+            `[git-guard R1b BLOCKED] ${reason}${listNote}` +
+            `${holders.size} other session(s) hold this checkout with uncommitted work:\n` +
+            `${describeHolders(holders)}\n\n` +
+            'DO NOT STEAMROLL GIT-GUARD!\n' +
+            'Edits to tracked files on a shared checkout collide: another session\'s stash, reset,\n' +
+            'checkout or commit will sweep up or clobber your change (and yours will theirs).\n' +
+            'This clears once those sessions commit their changes. New untracked or gitignored\n' +
+            'files are allowed meanwhile; tracked files otherwise need a worktree.\n' +
+            'Use your agent\'s worktree tool, or `git worktree add -b feat/<name> .worktrees/<name>`.\n' +
+            'Do NOT just create a branch in place — that moves every session listed above onto your branch.\n' +
+            'Do NOT delete state files or work around this.\n'
+          );
+          process.exit(2);
+        }
       }
     }
   }
 
   // R2: Branch drift detection
-  const state = readSessionState(key);
-
-  // The marker only ever goes true → false: one tracked (or unprovable)
-  // edit makes this session a tracked-file editor for R1b from then on.
-  const untrackedOnly = provenUntracked && (!state || state.untracked_only === true);
-
   if (!state) {
-    writeSessionState(key, branch, sessionId, toplevel, untrackedOnly);
+    writeSessionState(key, branch, sessionId, toplevel, editedFiles);
     process.exit(0);
   }
 
@@ -390,8 +529,8 @@ function handleEditWrite(sessionId, filePath) {
     // Rewrite on every allowed edit: refreshes recorded_at (sessions expire
     // STALE_MS after their LAST edit, not their first — a session running
     // longer than a day used to drop out of R1b/R4 while still editing) and
-    // clears the untracked-only mark once a tracked file is touched.
-    writeSessionState(key, branch, sessionId, toplevel, untrackedOnly);
+    // records the file just edited.
+    writeSessionState(key, branch, sessionId, toplevel, editedFiles);
     process.exit(0);
   }
 
@@ -401,7 +540,7 @@ function handleEditWrite(sessionId, filePath) {
       encoding: 'utf-8', timeout: 5000, stdio: 'pipe',
     });
   } catch {
-    writeSessionState(key, branch, sessionId, toplevel, untrackedOnly);
+    writeSessionState(key, branch, sessionId, toplevel, editedFiles);
     process.exit(0);
   }
 

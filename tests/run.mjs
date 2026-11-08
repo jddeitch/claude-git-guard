@@ -13,6 +13,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as url from 'node:url';
+import { createHash } from 'node:crypto';
 
 const HOOK = url.fileURLToPath(new URL('../git-guard.mjs', import.meta.url));
 
@@ -76,26 +77,31 @@ function git(repo, ...args) {
 
 // Fake another active session by writing its state file, exactly as the
 // hook would after that session's first Edit/Write on `repo`.
-function fakeOtherSession(stateDir, repo, sessionId = 'other-session-0001') {
+// `extra` adds state fields (e.g. edited_files); without it the state has
+// the pre-0.2.0 shape, whose edits are unknown.
+function fakeOtherSession(stateDir, repo, sessionId = 'other-session-0001', extra = {}) {
   const toplevel = git(repo, 'rev-parse', '--show-toplevel');
   const branch = git(repo, 'rev-parse', '--abbrev-ref', 'HEAD');
   fs.writeFileSync(
     path.join(stateDir, `${sessionId}-fake.json`),
-    JSON.stringify({ branch, session_id: sessionId, toplevel, recorded_at: Date.now() })
+    JSON.stringify({ branch, session_id: sessionId, toplevel, recorded_at: Date.now(), ...extra })
   );
 }
 
-// A repo on a feature branch with one committed file and a .gitignore,
-// plus a state dir in which another session is active on the same checkout.
+// A repo on a feature branch with committed files and a .gitignore, plus a
+// state dir in which another session holds the same checkout: it edited
+// OTHER.md and hasn't committed the change.
 function sharedCheckout() {
   const repo = tmpDir('cggt-');
   const state = tmpDir('cggs-');
   initRepo(repo, 'feat/shared');
   fs.writeFileSync(path.join(repo, 'README.md'), 'tracked\n');
+  fs.writeFileSync(path.join(repo, 'OTHER.md'), 'theirs\n');
   fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored/\n*.log\n');
-  git(repo, 'add', 'README.md', '.gitignore');
+  git(repo, 'add', 'README.md', 'OTHER.md', '.gitignore');
   git(repo, 'commit', '-q', '-m', 'files');
-  fakeOtherSession(state, repo);
+  fs.appendFileSync(path.join(repo, 'OTHER.md'), 'uncommitted\n');
+  fakeOtherSession(state, repo, 'other-session-0001', { edited_files: { 'OTHER.md': Date.now() } });
   return { repo, state };
 }
 
@@ -401,10 +407,19 @@ function plainRepo() {
   fs.writeFileSync(path.join(repo, 'README.md'), 'tracked\n');
   git(repo, 'add', 'README.md');
   git(repo, 'commit', '-q', '-m', 'files');
-  const edit = (sessionId, file, tool = 'Edit') => runHook(
-    { tool_name: tool, tool_input: { file_path: path.join(repo, file) }, session_id: sessionId },
-    { GIT_GUARD_STATE_DIR: state }
-  );
+  // Like the real tool: when the hook allows the call, the file changes.
+  const edit = (sessionId, file, tool = 'Edit') => {
+    const fp = path.join(repo, file);
+    const r = runHook(
+      { tool_name: tool, tool_input: { file_path: fp }, session_id: sessionId },
+      { GIT_GUARD_STATE_DIR: state }
+    );
+    if (r.code === 0) {
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      fs.appendFileSync(fp, `${sessionId}\n`);
+    }
+    return r;
+  };
   return { repo, state, edit };
 }
 
@@ -458,6 +473,211 @@ test('R4: a draft-only session still counts for sweeping-command warnings', () =
       repo
     );
     assert(warningText(r).includes('"git add -A"'), `expected R4 warning naming B's presence, got: ${r.stdout}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+// R1b holds a checkout only while a session has uncommitted tracked work.
+
+test('R1b: a session stops holding the checkout once it commits', () => {
+  const { repo, state, edit } = plainRepo();
+  try {
+    fs.writeFileSync(path.join(repo, 'OTHER.md'), 'x\n');
+    git(repo, 'add', 'OTHER.md');
+    git(repo, 'commit', '-q', '-m', 'other');
+    assert(edit('session-A', 'README.md').code === 0, 'A tracked edit should pass');
+    const blocked = edit('session-B', 'OTHER.md');
+    assert(blocked.code === 2 && blocked.stderr.includes('README.md'), `B should be blocked by A's README.md; got ${blocked.code}: ${blocked.stderr}`);
+    git(repo, 'add', 'README.md');
+    git(repo, 'commit', '-q', '-m', 'A commits');
+    const r = edit('session-B', 'OTHER.md');
+    assert(r.code === 0, `B should pass after A committed; got ${r.code}: ${r.stderr}`);
+    const back = edit('session-A', 'README.md');
+    assert(back.code === 2 && back.stderr.includes('OTHER.md'), `A should now be blocked by B's OTHER.md; got ${back.code}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: a staged change counts as uncommitted', () => {
+  const { repo, state, edit } = plainRepo();
+  try {
+    assert(edit('session-A', 'README.md').code === 0, 'A tracked edit should pass');
+    git(repo, 'add', 'README.md');
+    const r = edit('session-B', 'README.md');
+    assert(r.code === 2 && r.stderr.includes('R1b BLOCKED'), `staged change should still hold; got ${r.code}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: a draft the session then stages holds the checkout', () => {
+  const { repo, state, edit } = plainRepo();
+  try {
+    assert(edit('session-A', 'draft.md', 'Write').code === 0, 'A draft should pass');
+    assert(edit('session-B', 'README.md').code === 0, 'an unstaged draft holds nothing');
+    git(repo, 'add', 'draft.md');
+    git(repo, 'commit', '-q', '-m', 'B is not holding after this', '--', 'README.md');
+    const r = edit('session-B', 'README.md');
+    assert(r.code === 2 && r.stderr.includes('draft.md'), `A's staged draft should hold; got ${r.code}: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: a change belongs to the session that edited the file last', () => {
+  const { repo, state, edit } = plainRepo();
+  try {
+    fs.writeFileSync(path.join(repo, 'OTHER.md'), 'x\n');
+    git(repo, 'add', 'OTHER.md');
+    git(repo, 'commit', '-q', '-m', 'other');
+    assert(edit('session-A', 'README.md').code === 0, 'A edit should pass');
+    git(repo, 'commit', '-q', '-am', 'A commits');
+    // B now edits the file A edited before; the change is B's, not A's.
+    assert(edit('session-B', 'README.md').code === 0, 'B edit after A committed should pass');
+    assert(edit('session-B', 'README.md').code === 0, 'B should not be blocked by its own change');
+    const r = edit('session-A', 'OTHER.md');
+    assert(r.code === 2 && r.stderr.includes('uncommitted changes in README.md'), `A should be blocked by B's change; got ${r.code}: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: state records every edited file, repo-relative', () => {
+  const { repo, state, edit } = plainRepo();
+  try {
+    assert(edit('session-A', 'README.md').code === 0, 'tracked edit should pass');
+    assert(edit('session-A', path.join('docs', 'new.md'), 'Write').code === 0, 'draft should pass');
+    const [file] = fs.readdirSync(state).filter(f => f.startsWith('session-A-'));
+    const data = JSON.parse(fs.readFileSync(path.join(state, file), 'utf-8'));
+    const keys = Object.keys(data.edited_files || {}).sort();
+    assert(JSON.stringify(keys) === '["README.md","docs/new.md"]', `got ${JSON.stringify(data)}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+// Sessions registered by an older git-guard: edits unknown.
+function legacyCheckout(extra = {}) {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  initRepo(repo, 'feat/shared');
+  fs.writeFileSync(path.join(repo, 'README.md'), 'tracked\n');
+  fs.writeFileSync(path.join(repo, 'OTHER.md'), 'other\n');
+  git(repo, 'add', 'README.md', 'OTHER.md');
+  git(repo, 'commit', '-q', '-m', 'files');
+  fakeOtherSession(state, repo, 'legacy-session-01', extra);
+  return { repo, state };
+}
+
+test('R1b: an older-version session on a clean checkout does not block', () => {
+  const { repo, state } = legacyCheckout();
+  try {
+    const r = runHook(editPayload(path.join(repo, 'README.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: an older-version session does not block on the target\'s own change', () => {
+  const { repo, state } = legacyCheckout();
+  try {
+    fs.appendFileSync(path.join(repo, 'README.md'), 'mine, from before\n');
+    const r = runHook(editPayload(path.join(repo, 'README.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: an older-version session holds while another file has an unclaimed change', () => {
+  const { repo, state } = legacyCheckout();
+  try {
+    fs.appendFileSync(path.join(repo, 'OTHER.md'), 'maybe theirs\n');
+    const r = runHook(editPayload(path.join(repo, 'README.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 2, `expected exit 2, got ${r.code}`);
+    assert(r.stderr.includes('older git-guard') && r.stderr.includes('OTHER.md'), `got: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: an older-version session does not hold a change another session claims', () => {
+  const { repo, state } = legacyCheckout();
+  try {
+    // Session "me" edited OTHER.md (claimed in its state) and left it uncommitted.
+    fs.writeFileSync(path.join(state, 'me-own.json'), JSON.stringify({
+      branch: 'feat/shared', session_id: 'me', toplevel: git(repo, 'rev-parse', '--show-toplevel'),
+      recorded_at: Date.now(), edited_files: { 'OTHER.md': Date.now() },
+    }));
+    fs.appendFileSync(path.join(repo, 'OTHER.md'), 'mine\n');
+    const r = runHook(editPayload(path.join(repo, 'README.md'), 'someone-else'), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 2 && !r.stderr.includes('legacy-s'), `blocked by the claimant only, not the legacy session; got ${r.code}: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: a pre-release untracked_only session never holds', () => {
+  const { repo, state } = legacyCheckout({ untracked_only: true });
+  try {
+    fs.appendFileSync(path.join(repo, 'OTHER.md'), 'unclaimed\n');
+    const r = runHook(editPayload(path.join(repo, 'README.md')), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+// An older-version session's own state upgrades once nothing unclaimed is left.
+function legacySelf(repo, state, sessionId) {
+  const toplevel = git(repo, 'rev-parse', '--show-toplevel');
+  // The hook's key is `${sessionId}-${md5(toplevel).slice(0, 8)}`; match it so
+  // the hook reads this as the session's own state.
+  const hash = createHash('md5').update(toplevel).digest('hex').slice(0, 8);
+  const fp = path.join(state, `${sessionId}-${hash}.json`);
+  fs.writeFileSync(fp, JSON.stringify({ branch: 'feat/shared', session_id: sessionId, toplevel, recorded_at: Date.now() }));
+  return () => JSON.parse(fs.readFileSync(fp, 'utf-8'));
+}
+
+test('R1b: an older-version session starts a file list once no unclaimed change is left', () => {
+  const { repo, state } = legacyCheckout();
+  try {
+    const read = legacySelf(repo, state, 'upgrading');
+    fs.appendFileSync(path.join(repo, 'README.md'), 'target change\n');
+    const r = runHook(editPayload(path.join(repo, 'README.md'), 'upgrading'), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+    const files = read().edited_files;
+    assert(files && Object.keys(files).join() === 'README.md', `expected a fresh list, got ${JSON.stringify(read())}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R1b: an older-version session stays unknown while an unclaimed change exists elsewhere', () => {
+  const { repo, state } = legacyCheckout();
+  try {
+    // Remove the other legacy session so this edit is not blocked.
+    for (const f of fs.readdirSync(state)) fs.unlinkSync(path.join(state, f));
+    const read = legacySelf(repo, state, 'still-unknown');
+    fs.appendFileSync(path.join(repo, 'OTHER.md'), 'maybe mine, from before\n');
+    const r = runHook(editPayload(path.join(repo, 'README.md'), 'still-unknown'), { GIT_GUARD_STATE_DIR: state });
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+    assert(read().edited_files === undefined, `expected unknown edits, got ${JSON.stringify(read())}`);
   } finally {
     cleanup(repo);
     cleanup(state);
