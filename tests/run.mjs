@@ -31,6 +31,14 @@ function initRepo(dir, branch) {
   spawnSync('git', ['-C', dir, 'commit', '--allow-empty', '-m', 'initial'], { stdio: 'pipe' });
 }
 
+// Add a linked worktree at <repo>/.worktrees/<name> on a new branch.
+function addWorktree(repo, branch, name) {
+  const wt = path.join(repo, '.worktrees', name);
+  const r = spawnSync('git', ['-C', repo, 'worktree', 'add', '-q', '-b', branch, wt], { stdio: 'pipe' });
+  if (r.status !== 0) throw new Error(`worktree add failed: ${r.stderr}`);
+  return wt;
+}
+
 function runHook(payload, env = {}, cwd = undefined) {
   const r = spawnSync('node', [HOOK], {
     input: JSON.stringify(payload),
@@ -131,6 +139,109 @@ test('R0: cd to a different repo is blocked', () => {
   } finally {
     cleanup(repo1);
     cleanup(repo2);
+    cleanup(state);
+  }
+});
+
+test('R0: cd from main checkout into its own worktree is allowed', () => {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'feat/x');
+    const wt = addWorktree(repo, 'feat/wt', 'wt');
+    const r = runHook(
+      { tool_name: 'Bash', tool_input: { command: `cd ${wt} && git status` }, session_id: 'r0-wt-in' },
+      { GIT_GUARD_STATE_DIR: state },
+      repo
+    );
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R0: cd from a worktree back to the main checkout is allowed', () => {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'feat/x');
+    const wt = addWorktree(repo, 'feat/wt', 'wt');
+    const r = runHook(
+      { tool_name: 'Bash', tool_input: { command: `cd ${repo} && git status` }, session_id: 'r0-wt-out' },
+      { GIT_GUARD_STATE_DIR: state },
+      wt
+    );
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R0: cd between sibling worktrees is allowed', () => {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'feat/x');
+    const wtA = addWorktree(repo, 'feat/a', 'a');
+    const wtB = addWorktree(repo, 'feat/b', 'b');
+    const r = runHook(
+      { tool_name: 'Bash', tool_input: { command: `cd ${wtB}` }, session_id: 'r0-sib' },
+      { GIT_GUARD_STATE_DIR: state },
+      wtA
+    );
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
+    cleanup(state);
+  }
+});
+
+test('R0: cd from a worktree into a different repo is still blocked', () => {
+  const repo = tmpDir('cggt-');
+  const other = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'feat/x');
+    initRepo(other, 'feat/y');
+    const wt = addWorktree(repo, 'feat/wt', 'wt');
+    const r = runHook(
+      { tool_name: 'Bash', tool_input: { command: `cd ${other} && git status` }, session_id: 'r0-wt-foreign' },
+      { GIT_GUARD_STATE_DIR: state },
+      wt
+    );
+    assert(r.code === 2, `expected exit 2, got ${r.code}`);
+    assert(r.stderr.includes('R0 BLOCKED'), 'expected R0 BLOCKED');
+    assert(r.stderr.includes(other), 'expected target repo toplevel in message');
+  } finally {
+    cleanup(repo);
+    cleanup(other);
+    cleanup(state);
+  }
+});
+
+test('R0: cd to a case-variant path of the same repo is allowed (case-insensitive FS only)', () => {
+  const repo = tmpDir('cggt-');
+  const state = tmpDir('cggs-');
+  try {
+    initRepo(repo, 'feat/x');
+    const variant = path.join(path.dirname(repo), path.basename(repo).toUpperCase());
+    if (!fs.existsSync(variant)) {
+      console.log('      (skipped: filesystem is case-sensitive)');
+      return;
+    }
+    const wt = addWorktree(repo, 'feat/wt', 'wt');
+    // Hook runs in the worktree; target is the main checkout spelled in a
+    // different case. Common git dirs must canonicalize to the same path.
+    const r = runHook(
+      { tool_name: 'Bash', tool_input: { command: `cd ${variant}` }, session_id: 'r0-case' },
+      { GIT_GUARD_STATE_DIR: state },
+      wt
+    );
+    assert(r.code === 0, `expected exit 0, got ${r.code}; stderr: ${r.stderr}`);
+  } finally {
+    cleanup(repo);
     cleanup(state);
   }
 });

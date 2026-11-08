@@ -297,8 +297,54 @@ function extractCdTarget(command) {
 }
 
 /**
+ * Canonicalize a path: resolve symlinks and, on case-insensitive filesystems
+ * (macOS default), the on-disk case. Uses the native realpath(3) — Node's JS
+ * `fs.realpathSync` resolves symlinks but keeps the caller's case, so
+ * `/Users/jd/projects` and `/Users/jd/Projects` would read as two paths.
+ * Returns the input unchanged if it can't be resolved (e.g. doesn't exist).
+ */
+function canonicalPath(p) {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * Resolve the canonical common git dir for a working dir. Sibling worktrees
+ * of one repo share this dir even though their toplevels differ. Throws if
+ * `cwd` is not inside a git repo.
+ */
+function resolveCommonGitDir(cwd) {
+  const out = execFileSync('git', ['-C', cwd, 'rev-parse', '--git-common-dir'], {
+    encoding: 'utf-8', timeout: 5000,
+  }).trim();
+  return canonicalPath(path.isAbsolute(out) ? out : path.resolve(cwd, out));
+}
+
+/**
+ * Best-effort toplevel for a working dir — for human-readable messages only.
+ */
+function safeToplevel(cwd) {
+  try {
+    return execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf-8', timeout: 5000,
+    }).trim();
+  } catch {
+    return '(unknown)';
+  }
+}
+
+/**
  * Check if a cd target would leave the current git repo.
  * Returns { blocked: true, message } if it would, { blocked: false } otherwise.
+ *
+ * "Different repo" is decided by the COMMON git dir, not the worktree
+ * toplevel: `cd` into the repo's own `.worktrees/<branch>` (or any sibling
+ * worktree) shares the common git dir and is safe, so it must not be blocked.
+ * Only a move into a genuinely separate repo is the escape R0 exists to catch
+ * — there, later git commands would silently operate on the wrong project.
  */
 function checkCdEscape(cdTarget) {
   let absTarget;
@@ -314,34 +360,30 @@ function checkCdEscape(cdTarget) {
     return { blocked: false };
   }
 
-  let currentToplevel;
+  let currentCommon;
   try {
-    currentToplevel = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-      encoding: 'utf-8', timeout: 5000,
-    }).trim();
+    currentCommon = resolveCommonGitDir(process.cwd());
   } catch {
-    return { blocked: false };
+    return { blocked: false }; // hook CWD not in a git repo — nothing to escape from
   }
 
   // execFileSync (argv, no shell) so a cd target containing shell
   // metacharacters can't break out.
-  let targetToplevel;
+  let targetCommon;
   try {
-    targetToplevel = execFileSync('git', ['-C', absTarget, 'rev-parse', '--show-toplevel'], {
-      encoding: 'utf-8', timeout: 5000,
-    }).trim();
+    targetCommon = resolveCommonGitDir(absTarget);
   } catch {
-    return { blocked: false };
+    return { blocked: false }; // target not in a git repo — cd there can't retarget git
   }
 
-  if (currentToplevel === targetToplevel) return { blocked: false };
+  if (currentCommon === targetCommon) return { blocked: false };
 
   return {
     blocked: true,
     message:
       `[git-guard R0 BLOCKED] "cd ${cdTarget}" would move to a different git repo.\n` +
-      `  Current repo: ${currentToplevel}\n` +
-      `  Target repo:  ${targetToplevel}\n\n` +
+      `  Current repo: ${safeToplevel(process.cwd())}\n` +
+      `  Target repo:  ${safeToplevel(absTarget)}\n\n` +
       'DO NOT STEAMROLL GIT-GUARD!\n' +
       'This will cause all subsequent git commands to operate on the wrong repo.\n' +
       'Use absolute paths instead of cd, or run commands in a separate worktree.\n',
